@@ -118,8 +118,24 @@ public:
     // Every module the host knows about, with its current state.
     ModuleListing list_modules();
 
-    // One module's record, or nothing when the module is unknown here.
-    std::optional<ModuleRecord> module_record(const std::string& module);
+    // One module's record.
+    //
+    // A module this registry has never heard of is not an error and not an
+    // empty optional — it comes back as a record whose `state` is "absent" and
+    // whose `seq` is 0. That is the honest answer ("the host's view does not
+    // contain this module") and it is expressible in the state vocabulary
+    // itself, so callers need no second code path for the miss.
+    //
+    //   seq == 0  <=>  never observed. Core's sequence counter is pre-
+    //                  incremented, so a real record always carries seq >= 1.
+    //
+    // This deliberately does NOT return `? ModuleRecord`, which is what the
+    // draft contract said. An empty `?T` return is JSON null on the wire, and
+    // null is ALREADY how this path reports a failed call — logos_json_convert
+    // turns it into an invalid QVariant and core_service reports METHOD_FAILED.
+    // "found nothing" and "the call blew up" would be the same bytes for every
+    // non-Rust caller. The generator refuses `-> ?T` for exactly this reason.
+    ModuleRecord module_record(const std::string& module);
 
     // True when this module is up and usable *from the host's point of view*.
     //

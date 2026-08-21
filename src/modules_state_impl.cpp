@@ -102,6 +102,26 @@ struct PendingEvent {
     uint64_t seq;
 };
 
+// A fully zeroed record, used for two things:
+//   * the answer module_record() gives for a module it has never heard of, and
+//   * the starting point for a record first learned from a delta.
+//
+// Written out explicitly rather than leaning on std::map::operator[]'s
+// value-initialisation. That would in fact zero the members (ModuleRecord has
+// no user-provided constructor), but the guarantee is a language subtlety, and
+// the fields cannot carry default member initialisers: the impl header is
+// parsed as text to derive the contract, and a `uint64_t seq = 0;` field line
+// is a spelling the field scanner is not promised to read.
+ModuleRecord absentRecord(const std::string& name)
+{
+    ModuleRecord rec;
+    rec.module = name;
+    rec.state = kAbsent;
+    rec.loadedAt = 0;
+    rec.seq = 0;
+    return rec;
+}
+
 // ── INGEST AUTHORITY ─────────────────────────────────────────────────────────
 //
 // The problem
@@ -288,13 +308,15 @@ ModuleListing ModulesStateImpl::list_modules()
     return out;
 }
 
-std::optional<ModuleRecord> ModulesStateImpl::module_record(const std::string& module)
+ModuleRecord ModulesStateImpl::module_record(const std::string& module)
 {
     std::lock_guard<std::mutex> lock(reg().mutex);
     auto it = reg().records.find(module);
-    if (it == reg().records.end())
-        return std::nullopt;
-    return it->second;
+    if (it != reg().records.end())
+        return it->second;
+    // The miss answer, spoken in the state vocabulary rather than as a null.
+    // See the header for why this is not `? ModuleRecord`.
+    return absentRecord(module);
 }
 
 bool ModulesStateImpl::is_ready(const std::string& module)
@@ -356,6 +378,8 @@ bool ModulesStateImpl::note_transition(const std::string& authToken,
         if (it != reg().records.end() && seq <= it->second.seq)
             return false;
 
+        if (it == reg().records.end())
+            reg().records.emplace(module, absentRecord(module));
         StoredRecord& rec = reg().records[module];
         rec.module = module;
         rec.instance = instance;
@@ -363,11 +387,18 @@ bool ModulesStateImpl::note_transition(const std::string& authToken,
         rec.state = new_state;
         rec.reason = reason;
         rec.seq = seq;
-        // path / type / version / dependencies / dependents / loadedAt are
-        // SNAPSHOT-ONLY facts. A transition carries the lifecycle change, not
-        // the module's static metadata, so whatever a previous snapshot put
-        // there is preserved rather than blanked. A record first learned from a
-        // delta simply has them empty until the next snapshot fills them in.
+        // Two classes of field, treated differently on purpose:
+        //
+        //   instance / pid  are OVERWRITTEN, including to empty. They describe
+        //     the incarnation this transition is ABOUT — an unload's pid is the
+        //     pid that just went away — so a delta is authoritative for them
+        //     and a delta that says "no pid" means there is no pid.
+        //
+        //   path / type / version / dependencies / dependents / loadedAt are
+        //     SNAPSHOT-ONLY. A transition carries the lifecycle change, not the
+        //     module's static metadata, so whatever a previous snapshot put
+        //     there is preserved rather than blanked. A record first learned
+        //     from a delta simply has them empty until a snapshot fills them.
 
         if (seq > reg().highWaterSeq)
             reg().highWaterSeq = seq;
