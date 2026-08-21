@@ -1,0 +1,27 @@
+{
+  "name": "modules_state",
+  "display_name": "Module State",
+  "version": "0.1.0",
+  "description": "Read-only registry of module lifecycle state",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "universal",
+  "concurrency": "single",
+  "category": "system",
+  "main": "modules_state_plugin",
+  "dependencies": [],
+
+  "nix": {
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "external_libraries": [],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": [],
+      "extra_link_libraries": []
+    }
+  }
+}
