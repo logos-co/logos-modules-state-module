@@ -130,11 +130,21 @@ public:
     //                  incremented, so a real record always carries seq >= 1.
     //
     // This deliberately does NOT return `? ModuleRecord`, which is what the
-    // draft contract said. An empty `?T` return is JSON null on the wire, and
-    // null is ALREADY how this path reports a failed call — logos_json_convert
-    // turns it into an invalid QVariant and core_service reports METHOD_FAILED.
-    // "found nothing" and "the call blew up" would be the same bytes for every
-    // non-Rust caller. The generator refuses `-> ?T` for exactly this reason.
+    // draft contract said — but NOT for the reason the qt-generator's refusal
+    // gives. That message claims an empty `?T` is indistinguishable from a
+    // failed call; it is stale. The generated Qt consumer takes a
+    // `logos::CallError*` on every sync method and lp_invoke branches on
+    // `callErr.ok()`, never on the value, so an empty optional arrives as
+    // LP_OK with an invalid QVariant while a failure arrives as
+    // LP_ERR_UNAVAILABLE. The two ARE distinguishable today.
+    //
+    // The real reason to return a plain record is that it is better TYPED.
+    // `?T` is the one entry in the Qt type table that loses the value type
+    // (lidl_emit_common.cpp: Optional and `any` both map to bare QVariant), so
+    // `-> ?ModuleRecord` would hand every Qt caller an untyped QVariant and
+    // throw the struct away. `-> ModuleRecord` keeps it, and the miss stays
+    // expressible in the domain — `state: "absent"` — rather than as a
+    // wire-level absence a caller has to unwrap before it can branch.
     ModuleRecord module_record(const std::string& module);
 
     // True when this module is up and usable *from the host's point of view*.
