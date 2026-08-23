@@ -27,7 +27,7 @@ type ModuleListing { modules: [ModuleRecord], partial: bool, seq: uint }
 
 # read surface — open to every module
 method list_modules()              -> ModuleListing
-method module_record(module: tstr) -> ModuleRecord
+method module_record(module: tstr) -> ?ModuleRecord
 method is_ready(module: tstr)      -> bool
 method rejected_ingest_count()     -> uint
 
@@ -42,12 +42,40 @@ event module_state_changed(module, instance: ?tstr, pid: ?int,
 
 ## The state vocabulary
 
-`absent`, `unloaded`, `loading`, `loaded`, `ready`, `stopping`, `error`.
+Six **record** states — what a record from `list_modules` or `module_record`
+may carry:
+
+`unloaded`, `loading`, `loaded`, `ready`, `stopping`, `error`.
+
+and one **event-only** state, which no record ever carries:
+
+`absent`.
+
+`absent` exists to name the two *membership edges*: `absent -> unloaded` when
+the host discovers a module, `unloaded -> absent` when it prunes one. A
+transition needs a state on both sides, so without it those two edges cannot be
+events at all — and a consumer is back to inferring membership from
+package-install events plus a settle timer, which is what
+`logos-basecamp`'s `PackageCoordinator` does today and what this module exists
+to replace.
+
+It is not a record state. A module that is absent is simply **not in the
+listing**, and `module_record` answers the empty optional. One spelling for "not
+there", not two.
 
 Six of the seven are reachable against liblogos as it stands. `ready` is not —
 it becomes real when a module can report its own readiness. It ships anyway so
 consumers written now are not rewritten then. That is also why the read surface
 says `is_ready` and not `isLoaded`.
+
+### Divergence from the draft core specs (logos-lips#317)
+
+`spec-module-runtime.md` §3.4 spells the runtime vocabulary
+`unloaded | loaded | ready | stopping | error` — no `absent`. Ours diverges by
+exactly one **event-only transition target**, not by a sixth record state: a
+consumer that reads records already sees only spec vocabulary. Separately,
+`loading` is a record state we have and the drafts fold into `loaded`; that one
+is still open.
 
 **Normative forward-compatibility rule.** The wire type is `tstr` — LIDL has no
 enum, no union, no string-literal constraint. A consumer **must** treat an

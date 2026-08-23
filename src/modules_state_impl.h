@@ -43,8 +43,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STATE VOCABULARY  (wire type: tstr — LIDL has no enum)
 //
-//   "absent"    the host does not know this module (never discovered, or
-//               pruned because its files went away)
+// Six RECORD states — the ones a record returned by list_modules or
+// module_record may carry:
+//
 //   "unloaded"  known and installed, not running
 //   "loading"   the host has selected a loader and is bringing it up
 //   "loaded"    the plugin is up and its provider has published
@@ -52,11 +53,72 @@
 //   "stopping"  an orderly teardown is in progress
 //   "error"     it exited without being asked to
 //
-// Reachability against liblogos as it stands today: absent, unloaded, loading,
-// loaded, stopping and error are all reachable at real emission points.
-// "ready" is not — it becomes real when a module can report its own readiness.
-// It ships anyway so consumers written now are not rewritten then; that is the
-// same reason the read surface says is_ready() and not isLoaded().
+// and one EVENT-ONLY state, which no record ever carries:
+//
+//   "absent"    the host does not know this module
+//
+// ── WHY "absent" SURVIVES — DO NOT DELETE IT AS REDUNDANT ────────────────────
+//
+// It is the only way to name the two MEMBERSHIP EDGES of the graph, and those
+// edges are this module's headline claim:
+//
+//   absent -> unloaded   the host has just DISCOVERED a module. In liblogos
+//                        that is the upsert loop of
+//                        discoverInstalledModules (module_registry.cpp:80-94).
+//   unloaded -> absent   the host has just PRUNED one, because its files went
+//                        away (module_registry.cpp:96-108).
+//
+// A transition needs a state on BOTH sides. Strike `absent` and those two
+// edges have no old_state and no new_state to ride on, so they cannot be
+// events at all — and a consumer is back to what logos-basecamp does today:
+// PackageCoordinator.cpp:118-158 infers module lifecycle from PACKAGE-INSTALL
+// events plus a 100ms QTimer settle. Guessing membership from package events is
+// exactly what this module exists to stop doing.
+//
+// ── AND WHY IT IS EVENT-ONLY ─────────────────────────────────────────────────
+//
+// `absent` may appear as old_state or new_state in module_state_changed. It may
+// NEVER be the `state` of a record. A module that is absent is simply NOT IN
+// list_modules, and module_record answers an empty optional.
+//
+// It used to carry a second load: it was also module_record's MISS ANSWER, a
+// workaround for a generator that refused `-> ?T`. That refusal is gone, so the
+// miss is an empty optional and the second load with it. Two spellings for "not
+// there" is the drift this narrowing removes — a consumer that filtered
+// `state == "absent"` out of a listing and a consumer that checked has_value()
+// were two code paths for one fact, and only one of them stayed correct.
+//
+// The invariant holds BY CONSTRUCTION, not by convention: a transition into
+// `absent` removes the record (see note_transition in the .cpp), so there is no
+// spelling of the ingest surface that can put an absent record into the store.
+//
+// ── DIVERGENCE FROM THE DRAFT CORE SPECS (logos-lips#317) ────────────────────
+//
+// spec-module-runtime.md §3.4 spells the runtime's vocabulary
+// `unloaded | loaded | ready | stopping | error` — five states, no `absent`,
+// and it is normative there as a CDDL enum (logos.runtime_control.state).
+//
+// After the narrowing above, `absent` diverges as exactly one EVENT-ONLY
+// TRANSITION TARGET rather than as a sixth record state. A consumer that reads
+// records already sees only spec vocabulary; only an event subscriber ever sees
+// `absent`, and only on the two membership edges above. The drafts have no way
+// to say "discovered" or "pruned" — registry membership is not in their state
+// machine at all — so this is a deliberate addition, not drift.
+//
+// One other divergence, named here so it is not mistaken for the same thing:
+// `loading` is a RECORD state we have and the drafts do not. Their `loaded`
+// covers our loading+loaded ("Runtime has acquired or attached the selected
+// realization and is performing the applicable initialization and readiness
+// checks"). Folding the two is a live option; it is a separate question from
+// `absent` and is not settled here.
+//
+// ── REACHABILITY, TODAY ──────────────────────────────────────────────────────
+//
+// Against liblogos as it stands: absent, unloaded, loading, loaded, stopping
+// and error all have real emission points. "ready" does not — it becomes real
+// when a module can report its own readiness. It ships anyway so consumers
+// written now are not rewritten then; that is the same reason the read surface
+// says is_ready() and not isLoaded().
 //
 // NORMATIVE FORWARD-COMPATIBILITY RULE — this is the whole point of shipping
 // the full vocabulary, so it is a rule and not advice:
@@ -71,6 +133,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // One module's lifecycle facts, as reported by the host.
+//
+// `state` is one of the six RECORD states. It is never "absent": that one is an
+// event-only transition target, and a record for a module that is not there is
+// not a record — it is the empty optional module_record answers with.
 //
 // `instance` and `pid` answer different questions and both are cheap:
 //   instance — the host's persistence identity. STABLE across load/unload
@@ -116,36 +182,41 @@ public:
     // ── READ SURFACE ─────────────────────────────────────────────────────────
 
     // Every module the host knows about, with its current state.
+    //
+    // MEMBERSHIP IS THE LISTING. No record here ever carries state "absent" —
+    // a module that is absent is not a member, so it is not in `modules` at
+    // all. A consumer must not filter for it, and a consumer that finds it has
+    // found a bug in this module, not a module that went away.
     ModuleListing list_modules();
 
-    // One module's record.
+    // One module's record — or nothing at all.
     //
-    // A module this registry has never heard of is not an error and not an
-    // empty optional — it comes back as a record whose `state` is "absent" and
-    // whose `seq` is 0. That is the honest answer ("the host's view does not
-    // contain this module") and it is expressible in the state vocabulary
-    // itself, so callers need no second code path for the miss.
+    // EMPTY means "the host's view does not contain this module": never
+    // discovered, or discovered and since pruned. That is not an error, and it
+    // is not a record either. `absent` is an EVENT-ONLY state (see THE STATE
+    // VOCABULARY above), so there is exactly ONE spelling for "not there" and
+    // this is it.
     //
-    //   seq == 0  <=>  never observed. Core's sequence counter is pre-
-    //                  incremented, so a real record always carries seq >= 1.
+    // Why an optional and not a sentinel record: std::optional has a state no
+    // ModuleRecord value occupies, so nullopt is distinct from
+    // ModuleRecord{} — the distinction a bare record could never make. A caller
+    // branches on has_value(), not on a sentinel field it has to be told to
+    // look at. (It used to be told: the miss came back as `state:"absent"`,
+    // `seq:0`. That was a workaround for a generator that refused `-> ?T`, the
+    // refusal is gone, and the workaround went with it.)
     //
-    // This deliberately does NOT return `? ModuleRecord`, which is what the
-    // draft contract said — but NOT for the reason the qt-generator's refusal
-    // gives. That message claims an empty `?T` is indistinguishable from a
-    // failed call; it is stale. The generated Qt consumer takes a
-    // `logos::CallError*` on every sync method and lp_invoke branches on
-    // `callErr.ok()`, never on the value, so an empty optional arrives as
-    // LP_OK with an invalid QVariant while a failure arrives as
-    // LP_ERR_UNAVAILABLE. The two ARE distinguishable today.
-    //
-    // The real reason to return a plain record is that it is better TYPED.
-    // `?T` is the one entry in the Qt type table that loses the value type
-    // (lidl_emit_common.cpp: Optional and `any` both map to bare QVariant), so
-    // `-> ?ModuleRecord` would hand every Qt caller an untyped QVariant and
-    // throw the struct away. `-> ModuleRecord` keeps it, and the miss stays
-    // expressible in the domain — `state: "absent"` — rather than as a
-    // wire-level absence a caller has to unwrap before it can branch.
-    ModuleRecord module_record(const std::string& module);
+    // Over the wire the empty answer is JSON null, and on every surface this
+    // module is reached through, null does NOT mean the call failed:
+    //   * the generated Qt consumer decides success from the C ABI return code
+    //     (rc == LP_OK) and reports failure on a SEPARATE channel,
+    //     logos::CallError — never from the value. See logos-qt-sdk,
+    //     qt-generator/lidl_gen_qt_consumer.cpp:524-558.
+    //   * logoscore's `logosctl module call` answers
+    //     {"status":"ok","result":null}. On a null return it asks the module
+    //     for its published method list and says METHOD_NOT_FOUND only when the
+    //     method genuinely is not there — logos-logoscore-cli,
+    //     src/core_service/call_envelope.cpp:81-103.
+    std::optional<ModuleRecord> module_record(const std::string& module);
 
     // True when this module is up and usable *from the host's point of view*.
     //
@@ -173,7 +244,14 @@ public:
     // seq already stored for that module. Deliveries are not ordered — the
     // first call to an un-tokened target coalesces behind a handshake, so a
     // later push can land first — and per-module seq is what makes that
-    // harmless without any buffering or timing assumption.
+    // harmless without any buffering or timing assumption. The rule is TOTAL:
+    // it covers a module that has since gone absent too, which is why the .cpp
+    // keeps a seq tombstone for one that left the listing.
+    //
+    // A transition whose `new_state` is "absent" is a MEMBERSHIP EDGE. The
+    // event fires exactly as any other, but no absent record is stored: the
+    // module leaves the listing instead. That is what makes list_modules'
+    // never-absent invariant true by construction.
     bool note_transition(const std::string& authToken,
                          const std::string& module,
                          const std::optional<std::string>& instance,
@@ -190,8 +268,14 @@ public:
     // (capability_module always does) is still reported.
     //
     // Merge is per-record and uses the same seq rule as note_transition, so a
-    // delta that overtook the snapshot survives it. Records absent from the
-    // listing whose stored seq is older than the listing's seq are dropped.
+    // delta that overtook the snapshot survives it. Records missing from the
+    // listing whose stored seq is older than the listing's seq are dropped,
+    // each with its own state -> "absent" event.
+    //
+    // A snapshot record whose `state` is "absent" is contract-malformed —
+    // `absent` is event-only, and a snapshot spells non-membership by OMISSION.
+    // It is skipped, which makes it mean exactly what omitting it would have
+    // meant. One rule, not two.
     bool apply_snapshot(const std::string& authToken, const ModuleListing& listing);
 
     // Number of ingest calls refused. A counter, not an event: it exists so a

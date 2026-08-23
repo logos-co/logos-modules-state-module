@@ -62,6 +62,14 @@ namespace {
 // They live in this TU and not in the impl header on purpose: the generator
 // parses the header as text to derive the contract, so anything in it that is
 // not part of the contract is at best noise and at worst a dropped declaration.
+//
+// kAbsent is the EVENT-ONLY one, and the invariant it carries is checkable by
+// grep. It is READ where a module leaves the view (note_transition's
+// membership edge, and apply_snapshot's skip of a snapshot record that claims
+// it), and WRITTEN only into a PendingEvent — as the previousState of a module
+// a snapshot has just discovered, and as the new_state of one the snapshot
+// pruned. It is never assigned to a stored record's `state`, in any path. That
+// absence is the whole of list_modules' never-absent invariant.
 constexpr const char* kAbsent = "absent";
 constexpr const char* kLoaded = "loaded";
 constexpr const char* kReady  = "ready";
@@ -102,9 +110,16 @@ struct PendingEvent {
     uint64_t seq;
 };
 
-// A fully zeroed record, used for two things:
-//   * the answer module_record() gives for a module it has never heard of, and
-//   * the starting point for a record first learned from a delta.
+// A fully zeroed record: the starting point for a module first learned from a
+// delta, whose static metadata (path/type/version/deps) only a snapshot can
+// fill in.
+//
+// It is NOT a value any surface returns, and it deliberately leaves `state`
+// EMPTY. The one caller assigns a real state before storing it, and an empty
+// state is not in the vocabulary — so if a future path ever stores this seed
+// untouched, the result is visibly wrong rather than plausibly "absent". That
+// is the whole reason this stopped being called absentRecord(): it used to be
+// module_record()'s miss answer, and the miss is std::nullopt now.
 //
 // Written out explicitly rather than leaning on std::map::operator[]'s
 // value-initialisation. That would in fact zero the members (ModuleRecord has
@@ -112,11 +127,10 @@ struct PendingEvent {
 // the fields cannot carry default member initialisers: the impl header is
 // parsed as text to derive the contract, and a `uint64_t seq = 0;` field line
 // is a spelling the field scanner is not promised to read.
-ModuleRecord absentRecord(const std::string& name)
+ModuleRecord blankRecord(const std::string& name)
 {
     ModuleRecord rec;
     rec.module = name;
-    rec.state = kAbsent;
     rec.loadedAt = 0;
     rec.seq = 0;
     return rec;
@@ -196,7 +210,27 @@ const char* configuredIngestToken()
 // ─────────────────────────────────────────────────────────────────────────────
 struct ModulesStateRegistry {
     std::mutex mutex;
+
+    // MEMBERSHIP IS THIS MAP. Every module the host's view contains, and
+    // nothing else. No entry here ever has state "absent" — that state is an
+    // event-only transition target, so leaving the view means leaving the map.
     std::map<std::string, StoredRecord> records;
+
+    // Modules that WERE in `records` and are not any more, with the seq at
+    // which each left. Tombstones, and they exist for exactly one reason: the
+    // REPLAY RULE has to stay total.
+    //
+    // Before `absent` was narrowed, a departed module stayed in `records` as an
+    // absent record and its `seq` was what a late delta was compared against.
+    // Now it is erased — so without this table a delta that lost a race would
+    // find no stored seq, pass the rule, and resurrect a module the host has
+    // already pruned. This is the same tombstone, minus the fake record: one
+    // uint64 instead of a whole ModuleRecord, and unreachable from any read
+    // method, so it cannot be mistaken for membership.
+    //
+    // It grows with the number of modules ever seen, not with events. That is
+    // bounded by what is installed on the machine.
+    std::map<std::string, uint64_t> departedSeq;
 
     // Highest seq applied from any source. Reported as ModuleListing::seq.
     uint64_t highWaterSeq = 0;
@@ -227,6 +261,27 @@ static void* g_registrySlot = nullptr;
 static ModulesStateRegistry& reg()
 {
     return registryOf(g_registrySlot);
+}
+
+// The seq the REPLAY RULE compares an incoming delta against: what is stored
+// for this module, whether it is still a member or only a tombstone. Returns
+// false when this registry has never heard of the module at all, which is the
+// one case where any seq is newer.
+//
+// Callers hold reg().mutex.
+static bool storedSeqLocked(const std::string& module, uint64_t& out)
+{
+    auto it = reg().records.find(module);
+    if (it != reg().records.end()) {
+        out = it->second.seq;
+        return true;
+    }
+    auto t = reg().departedSeq.find(module);
+    if (t != reg().departedSeq.end()) {
+        out = t->second;
+        return true;
+    }
+    return false;
 }
 
 ModulesStateImpl::ModulesStateImpl() = default;
@@ -291,6 +346,12 @@ ModuleListing ModulesStateImpl::list_modules()
     // std::map iterates in key order, so the listing is sorted by module name.
     // Deterministic output is not cosmetic: it is what lets a test diff two
     // listings instead of set-comparing them.
+    //
+    // NOT FILTERED, on purpose. `records` is membership, so every entry belongs
+    // in the listing and none of them can be "absent" — the two mutators are
+    // the only writers and neither can store that state. A defensive filter
+    // here would hide the bug it was written to catch, and would re-introduce
+    // the second spelling of "not there" that narrowing `absent` removed.
     for (const auto& kv : reg().records)
         out.modules.push_back(kv.second);
 
@@ -308,15 +369,16 @@ ModuleListing ModulesStateImpl::list_modules()
     return out;
 }
 
-ModuleRecord ModulesStateImpl::module_record(const std::string& module)
+std::optional<ModuleRecord> ModulesStateImpl::module_record(const std::string& module)
 {
     std::lock_guard<std::mutex> lock(reg().mutex);
     auto it = reg().records.find(module);
     if (it != reg().records.end())
         return it->second;
-    // The miss answer, spoken in the state vocabulary rather than as a null.
-    // See the header for why this is not `? ModuleRecord`.
-    return absentRecord(module);
+    // The miss. A tombstone is not a hit: a module that was pruned is exactly
+    // as absent as one never discovered, and this method's job is to answer
+    // membership, not history.
+    return std::nullopt;
 }
 
 bool ModulesStateImpl::is_ready(const std::string& module)
@@ -374,31 +436,55 @@ bool ModulesStateImpl::note_transition(const std::string& authToken,
         // first. Per-module seq makes that harmless with no in-flight buffer,
         // no timing assumption and no lock held across an RPC in either
         // direction: a stale delta is simply dropped.
-        auto it = reg().records.find(module);
-        if (it != reg().records.end() && seq <= it->second.seq)
+        uint64_t stored = 0;
+        if (storedSeqLocked(module, stored) && seq <= stored)
             return false;
 
-        if (it == reg().records.end())
-            reg().records.emplace(module, absentRecord(module));
-        StoredRecord& rec = reg().records[module];
-        rec.module = module;
-        rec.instance = instance;
-        rec.pid = pid;
-        rec.state = new_state;
-        rec.reason = reason;
-        rec.seq = seq;
-        // Two classes of field, treated differently on purpose:
+        // THE MEMBERSHIP EDGE. `absent` is event-only, so a transition INTO it
+        // does not store an absent record — it removes the module from the
+        // listing and leaves a seq tombstone behind. The event still fires
+        // below, carrying the pair the caller computed, and the high-water seq
+        // still advances, so a consumer re-reading list_modules can still tell
+        // that something moved.
         //
-        //   instance / pid  are OVERWRITTEN, including to empty. They describe
-        //     the incarnation this transition is ABOUT — an unload's pid is the
-        //     pid that just went away — so a delta is authoritative for them
-        //     and a delta that says "no pid" means there is no pid.
-        //
-        //   path / type / version / dependencies / dependents / loadedAt are
-        //     SNAPSHOT-ONLY. A transition carries the lifecycle change, not the
-        //     module's static metadata, so whatever a previous snapshot put
-        //     there is preserved rather than blanked. A record first learned
-        //     from a delta simply has them empty until a snapshot fills them.
+        // This is the whole mechanism behind list_modules' never-absent
+        // invariant: there is no spelling of this method that puts an absent
+        // record into `records`.
+        if (new_state == kAbsent) {
+            // Leaving the view. Erase the record and leave a seq tombstone, so
+            // a delta that lost a race cannot resurrect a module the host has
+            // already pruned.
+            reg().records.erase(module);
+            reg().departedSeq[module] = seq;
+        } else {
+            auto it = reg().records.find(module);
+            if (it == reg().records.end())
+                reg().records.emplace(module, blankRecord(module));
+            // Coming back is membership again: drop the tombstone so it cannot
+            // outlive the record and shadow a later erase/re-add cycle.
+            reg().departedSeq.erase(module);
+            StoredRecord& rec = reg().records[module];
+            rec.module = module;
+            rec.instance = instance;
+            rec.pid = pid;
+            rec.state = new_state;
+            rec.reason = reason;
+            rec.seq = seq;
+            // Two classes of field, treated differently on purpose:
+            //
+            //   instance / pid  are OVERWRITTEN, including to empty. They
+            //     describe the incarnation this transition is ABOUT — an
+            //     unload's pid is the pid that just went away — so a delta is
+            //     authoritative for them and a delta that says "no pid" means
+            //     there is no pid.
+            //
+            //   path / type / version / dependencies / dependents / loadedAt
+            //     are SNAPSHOT-ONLY. A transition carries the lifecycle change,
+            //     not the module's static metadata, so whatever a previous
+            //     snapshot put there is preserved rather than blanked. A record
+            //     first learned from a delta simply has them empty until a
+            //     snapshot fills them.
+        }
 
         if (seq > reg().highWaterSeq)
             reg().highWaterSeq = seq;
@@ -433,20 +519,36 @@ bool ModulesStateImpl::apply_snapshot(const std::string& authToken,
         for (const ModuleRecord& incoming : listing.modules) {
             if (incoming.module.empty())
                 continue;
+
+            // A snapshot record claiming "absent" is contract-malformed: the
+            // state is event-only, and a snapshot spells non-membership by
+            // OMISSION. Skipping it makes it mean exactly what omitting it
+            // would have meant — the prune loop below then drops whatever we
+            // hold for that name. One rule for leaving the listing, not two.
+            if (incoming.state == kAbsent)
+                continue;
+
             present.insert(incoming.module);
 
             auto it = reg().records.find(incoming.module);
             const bool known = (it != reg().records.end());
 
-            // Same replay rule as note_transition, applied per record. A delta
-            // that overtook the snapshot is NEWER than the snapshot's view of
-            // that module, so it survives; the snapshot does not clobber it.
-            if (known && incoming.seq <= it->second.seq)
+            // Same replay rule as note_transition, applied per record, and
+            // consulting the tombstones for the same reason: a module that was
+            // pruned at a HIGHER seq than this snapshot's view of it must not
+            // be brought back by a snapshot that predates its departure.
+            uint64_t stored = 0;
+            if (storedSeqLocked(incoming.module, stored) && incoming.seq <= stored)
                 continue;
 
+            // An unknown module is one the host has just DISCOVERED, whether it
+            // is unknown because we never heard of it or because it departed
+            // and came back. Either way the edge it just crossed is
+            // absent -> incoming.state, which is the membership edge.
             const std::string previousState = known ? it->second.state : std::string(kAbsent);
 
             reg().records[incoming.module] = incoming;
+            reg().departedSeq.erase(incoming.module);
 
             if (incoming.seq > reg().highWaterSeq)
                 reg().highWaterSeq = incoming.seq;
@@ -464,13 +566,13 @@ bool ModulesStateImpl::apply_snapshot(const std::string& authToken,
         // host's view -> "absent". Guarded by seq so a module we learned about
         // from a delta that is NEWER than this snapshot is not dropped by a
         // snapshot that predates it.
+        // There is no `state == kAbsent` case to skip here any more: `records`
+        // is membership, so nothing in it can be absent.
         std::vector<std::string> toDrop;
         for (auto& kv : reg().records) {
             if (present.count(kv.first) != 0)
                 continue;
             if (kv.second.seq >= listing.seq)
-                continue;
-            if (kv.second.state == kAbsent)
                 continue;
             // Stamped with the listing's seq. Core's counter is global and
             // monotonic, so any later real delta about this module necessarily
@@ -481,8 +583,12 @@ bool ModulesStateImpl::apply_snapshot(const std::string& authToken,
                                            listing.seq});
             toDrop.push_back(kv.first);
         }
-        for (const std::string& name : toDrop)
+        for (const std::string& name : toDrop) {
             reg().records.erase(name);
+            // Same tombstone the note_transition membership edge leaves, for
+            // the same reason and at the seq the event above was stamped with.
+            reg().departedSeq[name] = listing.seq;
+        }
 
         if (listing.seq > reg().highWaterSeq)
             reg().highWaterSeq = listing.seq;
