@@ -71,7 +71,7 @@
 // A transition needs a state on BOTH sides. Strike `absent` and those two
 // edges have no old_state and no new_state to ride on, so they cannot be
 // events at all — and a consumer is back to what logos-basecamp does today:
-// PackageCoordinator.cpp:118-158 infers module lifecycle from PACKAGE-INSTALL
+// PackageCoordinator.cpp:117-157 infers module lifecycle from PACKAGE-INSTALL
 // events plus a 100ms QTimer settle. Guessing membership from package events is
 // exactly what this module exists to stop doing.
 //
@@ -247,6 +247,15 @@ public:
     // harmless without any buffering or timing assumption. The rule is TOTAL:
     // it covers a module that has since gone absent too, which is why the .cpp
     // keeps a seq tombstone for one that left the listing.
+    //
+    // THE TOMBSTONE PUTS A REQUIREMENT ON CORE, and it is not obvious from
+    // this side: a record pruned by apply_snapshot is tombstoned at the
+    // LISTING's seq, so core must stamp snapshot record seqs from the SAME
+    // global counter it stamps transitions from. Stamp them from anything
+    // else — a per-snapshot counter, or zero — and the tombstone is either
+    // unreachably high (a real later delta is dropped forever) or trivially
+    // low (a stale delta resurrects a module that is gone). One counter, both
+    // paths.
     //
     // A transition whose `new_state` is "absent" is a MEMBERSHIP EDGE. The
     // event fires exactly as any other, but no absent record is stored: the

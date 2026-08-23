@@ -525,7 +525,12 @@ bool ModulesStateImpl::apply_snapshot(const std::string& authToken,
             // OMISSION. Skipping it makes it mean exactly what omitting it
             // would have meant — the prune loop below then drops whatever we
             // hold for that name. One rule for leaving the listing, not two.
-            if (incoming.state == kAbsent)
+            // An EMPTY state is skipped by the same rule. `state` is tstr on
+            // the wire with no enum to enforce it, so a record that simply
+            // omitted the field would otherwise be admitted with state "" —
+            // a seventh, undeclared state, reachable from outside and
+            // indistinguishable from a real one to every consumer.
+            if (incoming.state == kAbsent || incoming.state.empty())
                 continue;
 
             present.insert(incoming.module);
