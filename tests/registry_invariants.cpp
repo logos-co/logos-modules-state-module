@@ -41,12 +41,14 @@ struct OpenIngest {
     ~OpenIngest() { unsetenv("LOGOS_MODULES_STATE_TEST_INGEST"); }
 };
 
-constexpr const char* kTok = "test-ingest";
-
+// A unit test calls the impl DIRECTLY, so there is no dispatch and therefore no
+// caller — logos::currentCaller() answers Unknown, correctly, and the real gate
+// refuses. The documented test door is what makes these invariants checkable in
+// CI at all; the closed-gate case below deliberately opens none.
 bool note(ModulesStateImpl& m, const std::string& mod,
           const std::string& from, const std::string& to, uint64_t seq)
 {
-    return m.note_transition(kTok, mod, std::nullopt, std::nullopt,
+    return m.note_transition(mod, std::nullopt, std::nullopt,
                              from, to, std::nullopt, seq);
 }
 
@@ -145,17 +147,17 @@ LOGOS_TEST(a_snapshot_record_with_no_state_is_not_admitted)
     listing.modules = { stateless, real };
     listing.seq     = 5;
 
-    LOGOS_ASSERT(m.apply_snapshot(kTok, listing));
+    LOGOS_ASSERT(m.apply_snapshot(listing));
     LOGOS_ASSERT(!m.module_record("ghost_module").has_value());
     LOGOS_ASSERT(m.module_record("irc_module").has_value());
 }
 
 // The gate is closed unless a door is opened, and this case deliberately opens
-// none. It is the reason the others may open one without weakening the claim.
+// none. With no dispatch the caller is Unknown, which is NOT the host, so the
+// structural gate refuses — the same answer a peer module gets.
 LOGOS_TEST(ingest_is_refused_when_no_door_is_open)
 {
     unsetenv("LOGOS_MODULES_STATE_TEST_INGEST");
-    unsetenv("LOGOS_MODULES_STATE_INGEST_TOKEN");
     ModulesStateImpl m;
 
     LOGOS_ASSERT(!note(m, "chat_module", "absent", "unloaded", 1));

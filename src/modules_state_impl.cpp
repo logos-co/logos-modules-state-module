@@ -1,5 +1,7 @@
 #include "modules_state_impl.h"
 
+#include <logos_caller.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -145,58 +147,56 @@ ModuleRecord blankRecord(const std::string& name)
 //   others to call is `ready`. The read surface is deliberately open; the
 //   ingest surface must not be.
 //
-// Why the token is an ARGUMENT and not a policy entry
-//   liblogos' AccessPolicy restricts by TARGET MODULE, with no per-method
-//   granularity. Restricting modules_state to caller "core" would lock out
-//   every reader, which is the entire point of the module. So the authority for
-//   the two ingest methods has to ride in the call itself.
+// THE GATE IS STRUCTURAL: the caller must be the HOST.
 //
-// Why this module cannot just check who called it
-//   LogosModuleContext exposes this module's own identity (moduleName(),
-//   instanceId(), modulePath()) and nothing about the CALLER. There is no
-//   caller-identity accessor to check against, so a shared secret is what is
-//   actually available today. If a caller-identity accessor lands later, this
-//   gate should be rewritten to use it and the token retired — a structural
-//   check beats a secret.
+//   logos::currentCaller() reports who is inside the current dispatch. A push
+//   from core arrives as {"kind":"host"}; a call from any module arrives as
+//   {"kind":"module","name":...}. So the check is what the caller IS, not what
+//   it knows, and there is no secret to distribute, rotate, or leak.
 //
-// The gate, and it is FAIL-CLOSED
-//   LOGOS_MODULES_STATE_INGEST_TOKEN set and non-empty
-//       -> ingest requires an exact match. This is the production shape: the
-//          host generates a per-run nonce, puts it in the module subprocess's
-//          environment when it spawns it, and sends it with every push. The
-//          module subprocess's environment is not readable by other modules'
-//          subprocesses, so the secret does not leak sideways.
-//   unset
-//       -> ALL ingest is refused. A build with no configured authority reports
-//          only what it was given by someone who proved authority, which is
-//          nothing. That is the correct answer, not an inconvenience.
-//   unset AND LOGOS_MODULES_STATE_TEST_INGEST=1
-//       -> the TEST-ONLY escape. Any token is accepted, and the module says so
-//          loudly on stderr once at first use and again on every accepted call,
-//          so an accidental production run is visible in the logs rather than
-//          silent.
+//   This replaces an authToken argument compared against a per-run nonce in
+//   LOGOS_MODULES_STATE_INGEST_TOKEN. That design existed only because the
+//   accessor did not: "LogosModuleContext exposes this module's own identity
+//   and nothing about the CALLER". It does now, and it reaches this module —
+//   measured, kind=host, at logos-module-builder master. A structural check
+//   beats a secret, so the token is retired along with the environment
+//   variable and the ModuleDescriptor.env plumbing it would have required
+//   across logos-container and logos-container-subprocess.
 //
-// The test escape is deliberately an ENVIRONMENT variable and not a method.
-// A method — `enable_test_ingest()` — would itself be callable by any module,
-// which would make the gate decorative. Environment is set by whoever launches
-// the process, which is the host or the developer, and never by a peer module.
+// WHAT `host` MEANS, precisely
+//   Rule 5 of the caller contract: the host arm carries NO name, because
+//   "core" and "capability_module" hold the same token value under two keys,
+//   and a name there "would be a coin flip presented as a fact". So this gate
+//   admits core OR capability_module. Both are host-side components of the
+//   runtime rather than peer modules, which is the distinction that matters
+//   here. It is not a finer grain than the identity can honestly support, and
+//   pretending otherwise would be worse than admitting both.
 //
-// STAGE 1 STATUS: nothing sets LOGOS_MODULES_STATE_INGEST_TOKEN yet, because
-// liblogos does not push yet. Every Stage-1 verification run therefore uses
-// LOGOS_MODULES_STATE_TEST_INGEST=1, and a run WITHOUT it is the proof that the
-// gate is closed by default.
+// WHY IT IS SAFE TO FAIL CLOSED ON `unknown`
+//   currentCaller() answers Unknown for anything that is not an inbound
+//   dispatch — a worker thread, a timer, onContextReady, an event emission —
+//   and for any identity this build cannot parse. Unknown is refused. The one
+//   way that bites in production is a MISPINNED BUILD: a stale
+//   logos-module-builder produces a plugin with no caller machinery at all, and
+//   then every push is refused while everything still compiles, links and
+//   loads. That failure is silent by construction, which is exactly why
+//   rejected_ingest_count() counts this gate and nothing else — it is the only
+//   thing that makes a degraded build visible from outside.
+//
+// THE TEST DOOR
+//   LOGOS_MODULES_STATE_TEST_INGEST=1 accepts any caller, with a loud stderr
+//   banner at first use and a line on every accepted write. It exists because a
+//   unit test calls the impl directly, with no dispatch and therefore no
+//   caller — Unknown, correctly — so without it the invariants below could only
+//   be exercised through a live daemon, which is not a thing CI does.
+//
+//   It is an ENVIRONMENT VARIABLE and not a method on purpose: a method —
+//   enable_test_ingest() — would itself be callable by any module, which would
+//   make the gate decorative.
 bool testIngestEnabled()
 {
     const char* v = std::getenv("LOGOS_MODULES_STATE_TEST_INGEST");
     return v != nullptr && std::strcmp(v, "1") == 0;
-}
-
-const char* configuredIngestToken()
-{
-    const char* v = std::getenv("LOGOS_MODULES_STATE_INGEST_TOKEN");
-    if (v == nullptr || v[0] == '\0')
-        return nullptr;
-    return v;
 }
 
 }  // namespace
@@ -287,24 +287,18 @@ static bool storedSeqLocked(const std::string& module, uint64_t& out)
 ModulesStateImpl::ModulesStateImpl() = default;
 ModulesStateImpl::~ModulesStateImpl() = default;
 
-// Shared by both ingest methods. Returns true when the caller proved authority;
-// increments the refusal counter and complains on stderr when it did not.
-static bool ingestAuthorised(const std::string& authToken)
+// Shared by both ingest methods. Returns true when the caller IS the host;
+// increments the refusal counter and complains on stderr when it is not.
+//
+// Order matters: the structural check comes first, so a machine that has the
+// test door open for some other module's suite still takes the real path here
+// whenever the real path can answer.
+static bool ingestAuthorised()
 {
-    const char* expected = configuredIngestToken();
+    const logos::LogosCaller caller = logos::currentCaller();
 
-    if (expected != nullptr) {
-        // Length-independent comparison is not worth it here: the token is a
-        // per-run nonce and a peer module gets one guess per RPC, not a timing
-        // oracle. Simplicity beats a false sense of hardening.
-        if (authToken == expected)
-            return true;
-        std::lock_guard<std::mutex> lock(reg().mutex);
-        ++reg().rejectedIngest;
-        std::fprintf(stderr,
-                     "[modules_state] REFUSED ingest: bad authToken\n");
-        return false;
-    }
+    if (caller.isHost())
+        return true;
 
     if (testIngestEnabled()) {
         bool warn = false;
@@ -316,20 +310,39 @@ static bool ingestAuthorised(const std::string& authToken)
         if (warn) {
             std::fprintf(stderr,
                 "[modules_state] *** TEST INGEST ENABLED ***\n"
-                "[modules_state] LOGOS_MODULES_STATE_TEST_INGEST=1 and no\n"
-                "[modules_state] LOGOS_MODULES_STATE_INGEST_TOKEN is set, so ANY\n"
-                "[modules_state] caller can write lifecycle facts. This is for\n"
-                "[modules_state] testing only. Never set this in production.\n");
+                "[modules_state] LOGOS_MODULES_STATE_TEST_INGEST=1, so ANY caller\n"
+                "[modules_state] can write lifecycle facts regardless of identity.\n"
+                "[modules_state] This is for testing only. Never set it in production.\n");
         }
-        std::fprintf(stderr, "[modules_state] TEST INGEST: accepting unauthenticated write\n");
+        std::fprintf(stderr, "[modules_state] TEST INGEST: accepting write from a non-host caller\n");
         return true;
     }
 
-    std::lock_guard<std::mutex> lock(reg().mutex);
-    ++reg().rejectedIngest;
-    std::fprintf(stderr,
-        "[modules_state] REFUSED ingest: no LOGOS_MODULES_STATE_INGEST_TOKEN is\n"
-        "[modules_state] configured, so this build accepts no writes at all.\n");
+    // Refused. The message names what the caller ACTUALLY was, because the two
+    // ways to land here need different fixes and are otherwise
+    // indistinguishable from outside:
+    //
+    //   kind=module  a peer module tried to write lifecycle facts. Working as
+    //                intended; this is the case the gate exists for.
+    //   kind=unknown either a non-dispatch context, or A MISPINNED BUILD whose
+    //                plugin carries no caller machinery at all. The second is
+    //                silent everywhere else — it compiles, links and loads —
+    //                so naming it here is the only warning anyone gets.
+    {
+        std::lock_guard<std::mutex> lock(reg().mutex);
+        ++reg().rejectedIngest;
+    }
+    if (caller.isUnknown()) {
+        std::fprintf(stderr,
+            "[modules_state] REFUSED ingest: caller identity is UNKNOWN.\n"
+            "[modules_state] Either this was not an inbound call, or this build\n"
+            "[modules_state] carries no caller machinery -- check that\n"
+            "[modules_state] logos-module-builder is not pinned stale.\n");
+    } else {
+        std::fprintf(stderr,
+            "[modules_state] REFUSED ingest: caller is '%s', not the host.\n",
+            caller.name.empty() ? "<unnamed non-host>" : caller.name.c_str());
+    }
     return false;
 }
 
@@ -400,16 +413,15 @@ uint64_t ModulesStateImpl::rejected_ingest_count()
 // Ingest surface
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool ModulesStateImpl::note_transition(const std::string& authToken,
-                                       const std::string& module,
-                                       const std::optional<std::string>& instance,
-                                       const std::optional<int64_t>& pid,
-                                       const std::string& old_state,
-                                       const std::string& new_state,
-                                       const std::optional<std::string>& reason,
-                                       uint64_t seq)
+bool ModulesStateImpl::note_transition(const std::string& module,
+                                      const std::optional<std::string>& instance,
+                                      const std::optional<int64_t>& pid,
+                                      const std::string& old_state,
+                                      const std::string& new_state,
+                                      const std::optional<std::string>& reason,
+                                      uint64_t seq)
 {
-    if (!ingestAuthorised(authToken))
+    if (!ingestAuthorised())
         return false;
 
     // Malformed arguments are refused but NOT counted as an authority refusal:
@@ -504,10 +516,9 @@ bool ModulesStateImpl::note_transition(const std::string& authToken,
     return true;
 }
 
-bool ModulesStateImpl::apply_snapshot(const std::string& authToken,
-                                      const ModuleListing& listing)
+bool ModulesStateImpl::apply_snapshot(const ModuleListing& listing)
 {
-    if (!ingestAuthorised(authToken))
+    if (!ingestAuthorised())
         return false;
 
     std::vector<PendingEvent> pending;

@@ -16,9 +16,10 @@
 // THE TWO SURFACES
 //   read   — list_modules / module_record / is_ready, plus the
 //            module_state_changed event. Open to every module.
-//   ingest — note_transition / apply_snapshot. Gated by `authToken`, and
-//            intended for exactly one caller: liblogos core. See INGEST
-//            AUTHORITY in modules_state_impl.cpp.
+//   ingest — note_transition / apply_snapshot. Admitted only when
+//            logos::currentCaller() reports the HOST, so authority is what the
+//            caller IS rather than what it knows and there is no secret to
+//            distribute. See INGEST AUTHORITY in modules_state_impl.cpp.
 //
 // STAGE 1 (this repo, right now)
 //   Nothing feeds it. The ingest surface is the only way state enters, which
@@ -229,14 +230,14 @@ public:
     // that goes true a few hundred milliseconds early.
     bool is_ready(const std::string& module);
 
-    // ── INGEST SURFACE (authToken-gated; core only) ───────────────────────────
+    // ── INGEST SURFACE (host-only) ────────────────────────────────────────────
 
     // Record one state transition. Returns true when it was applied.
     //
     // Returns FALSE for three different reasons, deliberately not
-    // distinguished on the wire (a probe must not be able to tell a bad token
-    // from a stale seq):
-    //   * the token was refused,
+    // distinguished on the wire (a probe must not be able to tell a refused
+    // caller from a stale seq):
+    //   * the caller is not the host,
     //   * `seq` was not newer than what is already stored for this module,
     //   * old_state/new_state were empty.
     //
@@ -261,8 +262,7 @@ public:
     // event fires exactly as any other, but no absent record is stored: the
     // module leaves the listing instead. That is what makes list_modules'
     // never-absent invariant true by construction.
-    bool note_transition(const std::string& authToken,
-                         const std::string& module,
+    bool note_transition(const std::string& module,
                          const std::optional<std::string>& instance,
                          const std::optional<int64_t>& pid,
                          const std::string& old_state,
@@ -285,11 +285,15 @@ public:
     // `absent` is event-only, and a snapshot spells non-membership by OMISSION.
     // It is skipped, which makes it mean exactly what omitting it would have
     // meant. One rule, not two.
-    bool apply_snapshot(const std::string& authToken, const ModuleListing& listing);
+    bool apply_snapshot(const ModuleListing& listing);
 
-    // Number of ingest calls refused. A counter, not an event: it exists so a
-    // test can prove the gate is closed, and so an operator can see a module
-    // trying to forge lifecycle facts.
+    // Number of ingest calls refused BY THE AUTHORITY GATE — not stale-seq
+    // drops, not malformed arguments. A counter, not an event.
+    //
+    // It carries more weight than it looks: a build whose caller machinery is
+    // missing (a stale logos-module-builder pin) refuses every push while
+    // compiling, linking and loading perfectly, so this counter climbing while
+    // the listing stays empty is the only external symptom that failure has.
     uint64_t rejected_ingest_count();
 
 logos_events:
