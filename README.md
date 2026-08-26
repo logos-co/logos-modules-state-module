@@ -93,9 +93,32 @@ module can hold. A caller that wants "can I call it" wants
 `whenObjectAvailable()` on its own client.
 
 **Subscribe with `onEventWhenAvailable`, not `requestObject` + `onEvent`.** The
-plain subscription is one-shot and is refused before the registry handshake.
-The generated typed wrapper (`logos.modules_state.on("module_state_changed", …)`)
-already does the right thing; only hand-rolled call sites are exposed.
+plain subscription is one-shot, and it is refused whenever this module has not
+*published* yet — which is not the same as "not loaded". `load-module` returns
+when the plugin is in; publishing happens after, and `requestObject` refuses in
+between:
+
+```
+LogosAPIConsumer::requestObject  ->  if (!m_transport->isConnected()) { qWarning(...); return nullptr; }
+                                     logos-protocol, cpp/logos_api_consumer.cpp:610
+```
+
+`isConnected()` probes for a listener on the module's socket, so this is a
+LIVENESS PROBE, not a handshake. It is deterministic, not a cold-start fluke:
+subscribing to a module that is not up yet fails 3/3 warm, every time. The
+generated typed wrapper
+(`logos.modules_state.on("module_state_changed", …)`) uses
+`onEventWhenAvailable` and arms a retry, so it is immune; only hand-rolled call
+sites are exposed.
+
+Two traps if you write one yourself:
+
+* `onEventWhenAvailable` **refuses an empty event name**
+  (`logos_api_consumer.cpp:558`), while `LogosObject::onEvent` reads empty as
+  *wildcard*. Swapping one for the other silently kills the subscribe-to-all
+  form. Route a wildcard through `whenObjectAvailable()` instead.
+* A refusal and a **typo'd module name** produce the byte-identical error, so a
+  failed subscribe does not tell you which one you have.
 
 ## Ingest authority
 
@@ -166,12 +189,15 @@ logoscore --config-dir "$LSDIR" load-module modules_state
 # silently observing nothing — the failure mode worth guarding, because it is
 # invisible.
 #
-# Observed ONCE, on a cold first run (first load of the plugin, first spawn of
-# capability_module from a fresh store path). It did NOT reproduce warm: 24/24
-# consecutive subscribes succeeded with delays of 0,1,2,3,4,6s. So the trigger
-# is startup cost, NOT a fixed window — which is exactly why a sleep is the
-# wrong fix. Any constant is either too short on a cold machine or wasted on a
-# warm one. Retry until subscribed.
+# The cause is that `watch` subscribes via requestObject, which refuses while
+# the module has not PUBLISHED yet — a liveness probe, not a timing window
+# (see "Two things that are easy to get wrong" above). load-module returns when
+# the plugin is in; publish lands afterwards.
+#
+# Which is why a sleep is the wrong fix. It is not a fixed window: 24/24
+# consecutive subscribes succeed warm at delays of 0,1,2,3,4,6s, and the one
+# failure was a cold first run where publish took longer. Any constant is
+# either too short on a cold machine or wasted on a warm one. Retry instead.
 for attempt in 1 2 3 4 5; do
     logoscore --config-dir "$LSDIR" watch modules_state \
         --event module_state_changed > "$LSDIR/events.log" 2>&1 &
