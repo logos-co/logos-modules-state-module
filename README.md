@@ -151,8 +151,28 @@ lm result/lib/modules_state_plugin.dylib
 LSDIR=$(mktemp -d)                 # per-invocation: a leaked daemon poisons later runs
 export LOGOS_MODULES_STATE_TEST_INGEST=1
 logoscore --config-dir "$LSDIR" -D -m "$PWD/result-install/modules" &
+
+# WAIT for the daemon to accept commands. `-D &` returns before it is
+# listening, so a load-module issued straight after it races the socket.
+until logoscore --config-dir "$LSDIR" status >/dev/null 2>&1; do sleep 0.5; done
+
 logoscore --config-dir "$LSDIR" load-module modules_state
+
+# THEN WAIT AGAIN before subscribing, and do not shorten this.
+#
+# `watch` is the hand-rolled subscription this README warns about above: it is
+# ONE-SHOT and is REFUSED before the registry handshake completes. Subscribing
+# ~2s after load-module reliably answers
+#     {"code":"WATCH_FAILED","message":"Failed to watch events ..."}
+# and — because it is one-shot — it never retries, so the rest of the script
+# runs and passes while silently observing nothing. Measured on macOS: 2s
+# fails, 6s succeeds. This is a race, not a module bug; the generated typed
+# wrapper (`logos.modules_state.on(...)`) uses onEventWhenAvailable and needs
+# none of this.
+sleep 6
 logoscore --config-dir "$LSDIR" watch modules_state --event module_state_changed &
+sleep 2
+
 logoscore --config-dir "$LSDIR" call modules_state note_transition \
     dev chat_module 'json:null' 'json:null' unloaded loaded 'json:null' 1
 logoscore --config-dir "$LSDIR" call modules_state list_modules
@@ -160,6 +180,12 @@ logoscore --config-dir "$LSDIR" stop
 ```
 
 An empty optional in a positional slot is `'json:null'` — arity never changes.
+
+A miss comes back as `{"status":"ok","result":null}` — `null` is the empty
+optional, **not** a failed call. Verified end-to-end:
+`module_record nope` answers exactly that, while `list_modules` answers
+`{"modules":[...],"partial":true,"seq":2}` and a replayed `seq` answers
+`"result":false`.
 
 ## Thread safety
 
