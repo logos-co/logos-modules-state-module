@@ -158,20 +158,28 @@ until logoscore --config-dir "$LSDIR" status >/dev/null 2>&1; do sleep 0.5; done
 
 logoscore --config-dir "$LSDIR" load-module modules_state
 
-# THEN WAIT AGAIN before subscribing, and do not shorten this.
+# RETRY the subscribe. Do not replace this with a longer sleep.
 #
-# `watch` is the hand-rolled subscription this README warns about above: it is
-# ONE-SHOT and is REFUSED before the registry handshake completes. Subscribing
-# ~2s after load-module reliably answers
+# `watch` can answer
 #     {"code":"WATCH_FAILED","message":"Failed to watch events ..."}
-# and — because it is one-shot — it never retries, so the rest of the script
-# runs and passes while silently observing nothing. Measured on macOS: 2s
-# fails, 6s succeeds. This is a race, not a module bug; the generated typed
-# wrapper (`logos.modules_state.on(...)`) uses onEventWhenAvailable and needs
-# none of this.
-sleep 6
-logoscore --config-dir "$LSDIR" watch modules_state --event module_state_changed &
-sleep 2
+# and it does NOT retry, so the rest of the script then runs and passes while
+# silently observing nothing — the failure mode worth guarding, because it is
+# invisible.
+#
+# Observed ONCE, on a cold first run (first load of the plugin, first spawn of
+# capability_module from a fresh store path). It did NOT reproduce warm: 24/24
+# consecutive subscribes succeeded with delays of 0,1,2,3,4,6s. So the trigger
+# is startup cost, NOT a fixed window — which is exactly why a sleep is the
+# wrong fix. Any constant is either too short on a cold machine or wasted on a
+# warm one. Retry until subscribed.
+for attempt in 1 2 3 4 5; do
+    logoscore --config-dir "$LSDIR" watch modules_state \
+        --event module_state_changed > "$LSDIR/events.log" 2>&1 &
+    WATCH_PID=$!
+    sleep 1
+    grep -q WATCH_FAILED "$LSDIR/events.log" || break
+    kill "$WATCH_PID" 2>/dev/null; sleep 1
+done
 
 logoscore --config-dir "$LSDIR" call modules_state note_transition \
     dev chat_module 'json:null' 'json:null' unloaded loaded 'json:null' 1
