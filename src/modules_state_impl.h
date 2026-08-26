@@ -59,9 +59,10 @@
 // Separately, `loading` is a record state we have and the drafts fold into
 // `loaded`; folding is a live option and is not settled here.
 //
-// `ready` has no emission point yet. It ships anyway so consumers written now
-// are not rewritten later — the same reason the read surface says is_ready()
-// and not isLoaded().
+// `ready` is emitted by liblogos when the module publishes its object, which is
+// later than `loaded` — the host owning the process. That gap is the window
+// is_ready() exists to answer, and is why the read surface says is_ready() and
+// not isLoaded().
 //
 // FORWARD-COMPATIBILITY RULE, normative: a consumer MUST treat an unrecognised
 // state as forward-compatible and fall back to "not loaded". It must not error
