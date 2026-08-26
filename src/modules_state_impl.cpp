@@ -12,85 +12,49 @@
 #include <string>
 #include <vector>
 
-// ═════════════════════════════════════════════════════════════════════════════
-// THREAD SAFETY — read this before touching anything below.
+// THREAD SAFETY — read before touching anything below.
 //
-// Where calls come from
-//   Inbound method calls arrive through the generated Qt glue. With
-//   `"concurrency": "single"` in metadata.json the glue dispatches one handler
-//   at a time, so in THIS build the handlers are already serialised and the
-//   mutex below is never contended.
+// Handlers are serialised today by `"concurrency": "single"`, so the mutex is
+// never contended in this build. It exists anyway for two reasons, either
+// sufficient: flipping that one metadata key must not silently introduce a data
+// race in the module whose job is to be the trustworthy answer about system
+// state; and the feed originates on liblogos' background asio thread, so this
+// module must not stake its invariants on somebody else's marshalling.
 //
-// Why the mutex exists anyway — two independent reasons, either sufficient
-//   1. `concurrency` is one metadata key. Flipping it to "multi" must not
-//      silently introduce a data race in the one module whose entire job is to
-//      be the trustworthy answer about system state. The lock makes that flip
-//      a performance decision instead of a correctness decision.
-//   2. The feed that is coming (liblogos ModuleManager) originates state
-//      changes on the container's BACKGROUND asio thread — a module crash is
-//      detected there, not on the main thread. Core is responsible for
-//      marshalling that onto its Qt queue before it leaves the host, but this
-//      module must not stake its own invariants on somebody else's marshalling
-//      being correct.
+// THE ONE RULE: never hold m_mutex across an event emission. Emitting crosses
+// the C ABI into the host and fans out to subscribers, any of which can call
+// straight back in — is_ready() is the obvious one. std::mutex is not
+// recursive, so emitting under the lock is a self-deadlock waiting for a
+// consumer to be written naturally.
 //
-// THE ONE RULE THAT MATTERS
-//   Never hold m_mutex across an event emission.
-//
-//   module_state_changed() is a generated body that marshals into JSON and
-//   crosses the C ABI into the host, which fans out to every subscriber. A
-//   subscriber can call straight back in — is_ready() is the obvious one, and
-//   it is exactly what a consumer reacting to an event would do. std::mutex is
-//   not recursive, so emitting under the lock is a self-deadlock waiting for a
-//   consumer to be written naturally.
-//
-//   Every mutator therefore follows the same shape, and there are no
-//   exceptions to it:
-//
-//       compute under the lock -> collect pending events into a local vector
-//       -> release the lock -> emit
-//
-//   That is the same compute-under-lock/dispatch-after discipline the liblogos
-//   registry observer will use on the other side of the wire.
-// ═════════════════════════════════════════════════════════════════════════════
+// Every mutator therefore follows one shape, with no exceptions:
+//   compute under the lock -> collect pending events -> release -> emit.
 
 namespace {
 
-// ── The state vocabulary ─────────────────────────────────────────────────────
-// Free functions rather than an enum: the wire type is `tstr` (LIDL has no
-// enum, no union, no string-literal constraint), and an enum here would invite
-// treating an unrecognised state as an error — the single thing the contract
-// forbids.
+// Free constants rather than an enum: the wire type is `tstr`, and an enum here
+// would invite treating an unrecognised state as an error — the one thing the
+// contract forbids. They live in this TU because the generator parses the
+// header as text, so anything there that is not contract is noise at best.
 //
-// They live in this TU and not in the impl header on purpose: the generator
-// parses the header as text to derive the contract, so anything in it that is
-// not part of the contract is at best noise and at worst a dropped declaration.
-//
-// kAbsent is the EVENT-ONLY one, and the invariant it carries is checkable by
-// grep. It is READ where a module leaves the view (note_transition's
-// membership edge, and apply_snapshot's skip of a snapshot record that claims
-// it), and WRITTEN only into a PendingEvent — as the previousState of a module
-// a snapshot has just discovered, and as the new_state of one the snapshot
-// pruned. It is never assigned to a stored record's `state`, in any path. That
-// absence is the whole of list_modules' never-absent invariant.
+// kAbsent is the EVENT-ONLY one, and its invariant is checkable by grep: it is
+// READ where a module leaves the view, and WRITTEN only into a PendingEvent.
+// It is never assigned to a stored record's `state` on any path.
 constexpr const char* kAbsent = "absent";
 constexpr const char* kLoaded = "loaded";
 constexpr const char* kReady  = "ready";
 
 // "Up and usable, as far as the host is concerned."
 //
-// `loaded` is in this set BECAUSE `ready` is not reachable yet — nothing emits
-// it. If the set were {ready} alone, is_ready() would answer false forever and
-// the method would be useless on the day it ships.
+// `loaded` is in this set BECAUSE `ready` has no emission point yet; with
+// {ready} alone this would answer false forever. When a real loaded->ready
+// transition exists, `loaded` leaves the set — not a silent break, since the
+// only change is that is_ready() goes false during the loaded-but-not-ready
+// window, which is precisely the window a caller was asking about.
 //
-// When a real loaded->ready transition exists, `loaded` leaves this set. That
-// is not a silent break: the only visible change is that is_ready() goes false
-// during the loaded-but-not-yet-ready window, which is precisely the window a
-// caller of is_ready() was always asking about. Consumers get more correct, not
-// broken.
-//
-// Any state string this build does not recognise answers false — the same
-// forward-compatibility fallback the contract imposes on consumers. A module
-// that demands others tolerate unknown states has to do it itself.
+// An unrecognised state answers false: the same forward-compatibility fallback
+// the contract imposes on consumers. A module that demands others tolerate
+// unknown states has to do it itself.
 bool stateIsReady(const std::string& state)
 {
     return state == kLoaded || state == kReady;
@@ -112,23 +76,19 @@ struct PendingEvent {
     uint64_t seq;
 };
 
-// A fully zeroed record: the starting point for a module first learned from a
-// delta, whose static metadata (path/type/version/deps) only a snapshot can
-// fill in.
+// The starting point for a module first learned from a delta, whose static
+// metadata only a snapshot can fill in.
 //
-// It is NOT a value any surface returns, and it deliberately leaves `state`
-// EMPTY. The one caller assigns a real state before storing it, and an empty
-// state is not in the vocabulary — so if a future path ever stores this seed
-// untouched, the result is visibly wrong rather than plausibly "absent". That
-// is the whole reason this stopped being called absentRecord(): it used to be
-// module_record()'s miss answer, and the miss is std::nullopt now.
+// It deliberately leaves `state` EMPTY: the one caller assigns a real state
+// before storing, and an empty state is not in the vocabulary, so a future path
+// that stored this seed untouched would be visibly wrong rather than plausibly
+// "absent".
 //
-// Written out explicitly rather than leaning on std::map::operator[]'s
-// value-initialisation. That would in fact zero the members (ModuleRecord has
-// no user-provided constructor), but the guarantee is a language subtlety, and
-// the fields cannot carry default member initialisers: the impl header is
-// parsed as text to derive the contract, and a `uint64_t seq = 0;` field line
-// is a spelling the field scanner is not promised to read.
+// Written out rather than leaning on std::map::operator[]'s value-init: that
+// would in fact zero the members, but the guarantee is a language subtlety, and
+// the fields cannot carry default member initialisers because the header is
+// parsed as text and `uint64_t seq = 0;` is not a spelling the field scanner is
+// promised to read.
 ModuleRecord blankRecord(const std::string& name)
 {
     ModuleRecord rec;
@@ -140,59 +100,37 @@ ModuleRecord blankRecord(const std::string& name)
 
 // ── INGEST AUTHORITY ─────────────────────────────────────────────────────────
 //
-// The problem
-//   note_transition() and apply_snapshot() write the facts every other module
-//   is about to trust. If any module can call them, any module can forge a
-//   lifecycle event — announce that a rival crashed, or that a module it wants
-//   others to call is `ready`. The read surface is deliberately open; the
-//   ingest surface must not be.
+// note_transition and apply_snapshot write the facts every other module is
+// about to trust. Unguarded, any module could forge a lifecycle event —
+// announce that a rival crashed, or that a module it wants others to call is
+// `ready`. The read surface is open; this one must not be.
 //
-// THE GATE IS STRUCTURAL: the caller must be the HOST.
+// THE GATE IS STRUCTURAL: the caller must be the HOST. A push from core arrives
+// as {"kind":"host"}; a call from any module arrives as {"kind":"module",...}.
+// So authority is what the caller IS, not what it knows, and there is no secret
+// to distribute, rotate or leak. This replaced an authToken compared against a
+// per-run nonce, which existed only because the accessor did not.
 //
-//   logos::currentCaller() reports who is inside the current dispatch. A push
-//   from core arrives as {"kind":"host"}; a call from any module arrives as
-//   {"kind":"module","name":...}. So the check is what the caller IS, not what
-//   it knows, and there is no secret to distribute, rotate, or leak.
+// WHAT `host` MEANS: rule 5 of the caller contract gives the host arm no name,
+// because "core" and "capability_module" hold the same token value under two
+// keys and a name there "would be a coin flip presented as a fact". So this
+// admits core OR capability_module — both host-side runtime components rather
+// than peer modules, which is the distinction that matters.
 //
-//   This replaces an authToken argument compared against a per-run nonce in
-//   LOGOS_MODULES_STATE_INGEST_TOKEN. That design existed only because the
-//   accessor did not: "LogosModuleContext exposes this module's own identity
-//   and nothing about the CALLER". It does now, and it reaches this module —
-//   measured, kind=host, at logos-module-builder master. A structural check
-//   beats a secret, so the token is retired along with the environment
-//   variable and the ModuleDescriptor.env plumbing it would have required
-//   across logos-container and logos-container-subprocess.
+// FAIL CLOSED ON `unknown`. currentCaller() answers Unknown for anything that
+// is not an inbound dispatch, and for any identity this build cannot parse.
+// The case that bites is a MISPINNED BUILD: a stale logos-module-builder
+// produces a plugin with no caller machinery at all, so every push is refused
+// while everything still compiles, links and loads. This module ships alongside
+// a host that carries the machinery, and that pairing is the mitigation — there
+// is no counter on this surface to ask. The refusal goes to stderr, naming what
+// the caller actually was.
 //
-// WHAT `host` MEANS, precisely
-//   Rule 5 of the caller contract: the host arm carries NO name, because
-//   "core" and "capability_module" hold the same token value under two keys,
-//   and a name there "would be a coin flip presented as a fact". So this gate
-//   admits core OR capability_module. Both are host-side components of the
-//   runtime rather than peer modules, which is the distinction that matters
-//   here. It is not a finer grain than the identity can honestly support, and
-//   pretending otherwise would be worse than admitting both.
-//
-// WHY IT IS SAFE TO FAIL CLOSED ON `unknown`
-//   currentCaller() answers Unknown for anything that is not an inbound
-//   dispatch — a worker thread, a timer, onContextReady, an event emission —
-//   and for any identity this build cannot parse. Unknown is refused. The one
-//   way that bites in production is a MISPINNED BUILD: a stale
-//   logos-module-builder produces a plugin with no caller machinery at all, and
-//   then every push is refused while everything still compiles, links and
-//   loads. That failure is silent by construction, which is exactly why
-//   rejected_ingest_count() counts this gate and nothing else — it is the only
-//   thing that makes a degraded build visible from outside.
-//
-// THE TEST DOOR
-//   LOGOS_MODULES_STATE_TEST_INGEST=1 accepts any caller, with a loud stderr
-//   banner at first use and a line on every accepted write. It exists because a
-//   unit test calls the impl directly, with no dispatch and therefore no
-//   caller — Unknown, correctly — so without it the invariants below could only
-//   be exercised through a live daemon, which is not a thing CI does.
-//
-//   It is an ENVIRONMENT VARIABLE and not a method on purpose: a method —
-//   enable_test_ingest() — would itself be callable by any module, which would
-//   make the gate decorative.
+// THE TEST DOOR: LOGOS_MODULES_STATE_TEST_INGEST=1 accepts any caller, loudly.
+// A unit test calls the impl directly, so there is no dispatch and no caller,
+// and without it these invariants could only be driven through a live daemon —
+// which CI does not do. It is an environment variable and not a method on
+// purpose: a method would itself be callable by any module.
 bool testIngestEnabled()
 {
     const char* v = std::getenv("LOGOS_MODULES_STATE_TEST_INGEST");
@@ -211,25 +149,16 @@ bool testIngestEnabled()
 struct ModulesStateRegistry {
     std::mutex mutex;
 
-    // MEMBERSHIP IS THIS MAP. Every module the host's view contains, and
-    // nothing else. No entry here ever has state "absent" — that state is an
-    // event-only transition target, so leaving the view means leaving the map.
+    // MEMBERSHIP IS THIS MAP. No entry ever has state "absent": that is an
+    // event-only target, so leaving the view means leaving the map.
     std::map<std::string, StoredRecord> records;
 
-    // Modules that WERE in `records` and are not any more, with the seq at
-    // which each left. Tombstones, and they exist for exactly one reason: the
-    // REPLAY RULE has to stay total.
-    //
-    // Before `absent` was narrowed, a departed module stayed in `records` as an
-    // absent record and its `seq` was what a late delta was compared against.
-    // Now it is erased — so without this table a delta that lost a race would
-    // find no stored seq, pass the rule, and resurrect a module the host has
-    // already pruned. This is the same tombstone, minus the fake record: one
-    // uint64 instead of a whole ModuleRecord, and unreachable from any read
-    // method, so it cannot be mistaken for membership.
-    //
-    // It grows with the number of modules ever seen, not with events. That is
-    // bounded by what is installed on the machine.
+    // Tombstones: modules that left `records`, and the seq at which each left.
+    // They exist so the REPLAY RULE stays total — without them a delta that
+    // lost a race would find no stored seq, pass the rule, and resurrect a
+    // module the host already pruned. Unreachable from any read method, so it
+    // cannot be mistaken for membership. Grows with modules ever seen, not with
+    // events, so it is bounded by what is installed.
     std::map<std::string, uint64_t> departedSeq;
 
     // Highest seq applied from any source. Reported as ModuleListing::seq.
@@ -237,11 +166,6 @@ struct ModulesStateRegistry {
 
     // See list_modules() for why this starts TRUE.
     bool partial = true;
-
-    // Refusals by the authority gate specifically — NOT stale-seq drops and NOT
-    // malformed arguments. Kept narrow so a test asserting "the gate is closed"
-    // asserts exactly that.
-    uint64_t rejectedIngest = 0;
 
     bool warnedAboutTestIngest = false;
 };
@@ -328,10 +252,6 @@ static bool ingestAuthorised()
     //                plugin carries no caller machinery at all. The second is
     //                silent everywhere else — it compiles, links and loads —
     //                so naming it here is the only warning anyone gets.
-    {
-        std::lock_guard<std::mutex> lock(reg().mutex);
-        ++reg().rejectedIngest;
-    }
     if (caller.isUnknown()) {
         std::fprintf(stderr,
             "[modules_state] REFUSED ingest: caller identity is UNKNOWN.\n"
@@ -356,27 +276,20 @@ ModuleListing ModulesStateImpl::list_modules()
     std::lock_guard<std::mutex> lock(reg().mutex);
 
     out.modules.reserve(reg().records.size());
-    // std::map iterates in key order, so the listing is sorted by module name.
-    // Deterministic output is not cosmetic: it is what lets a test diff two
-    // listings instead of set-comparing them.
+    // std::map iterates in key order, so the listing is sorted — deterministic
+    // output lets a test diff two listings instead of set-comparing them.
     //
-    // NOT FILTERED, on purpose. `records` is membership, so every entry belongs
-    // in the listing and none of them can be "absent" — the two mutators are
-    // the only writers and neither can store that state. A defensive filter
-    // here would hide the bug it was written to catch, and would re-introduce
-    // the second spelling of "not there" that narrowing `absent` removed.
+    // NOT FILTERED, on purpose: `records` is membership and neither mutator can
+    // store "absent", so a defensive filter would hide the bug it was written
+    // to catch.
     for (const auto& kv : reg().records)
         out.modules.push_back(kv.second);
 
-    // `partial` starts TRUE and only a snapshot can clear it.
-    //
-    // Before a snapshot has arrived, everything here was learned from
-    // individual deltas — which by construction only mention modules that
-    // CHANGED since this module came up. A module that has been quietly loaded
-    // the whole time is missing from that view. Reporting partial:false then
-    // would be a confidently short list, which is the exact failure this flag
-    // exists to prevent. After a snapshot, `partial` is whatever the host said:
-    // true when the host's own scan skipped a module it could not read.
+    // `partial` starts TRUE and only a snapshot can clear it. Deltas by
+    // construction only mention modules that CHANGED, so a module quietly
+    // loaded the whole time is missing from that view — reporting false would
+    // be a confidently short list, the exact failure this flag prevents. After
+    // a snapshot it is whatever the host said.
     out.partial = reg().partial;
     out.seq = reg().highWaterSeq;
     return out;
@@ -388,9 +301,8 @@ std::optional<ModuleRecord> ModulesStateImpl::module_record(const std::string& m
     auto it = reg().records.find(module);
     if (it != reg().records.end())
         return it->second;
-    // The miss. A tombstone is not a hit: a module that was pruned is exactly
-    // as absent as one never discovered, and this method's job is to answer
-    // membership, not history.
+    // A tombstone is not a hit: a pruned module is exactly as absent as one
+    // never discovered. This answers membership, not history.
     return std::nullopt;
 }
 
@@ -403,11 +315,6 @@ bool ModulesStateImpl::is_ready(const std::string& module)
     return stateIsReady(it->second.state);
 }
 
-uint64_t ModulesStateImpl::rejected_ingest_count()
-{
-    std::lock_guard<std::mutex> lock(reg().mutex);
-    return reg().rejectedIngest;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ingest surface
@@ -424,9 +331,9 @@ bool ModulesStateImpl::note_transition(const std::string& module,
     if (!ingestAuthorised())
         return false;
 
-    // Malformed arguments are refused but NOT counted as an authority refusal:
-    // rejected_ingest_count() has to mean "the gate turned someone away" and
-    // nothing else, or it stops being usable as a test assertion.
+    // Malformed arguments are refused, and are a different thing from the
+    // authority refusal above: the caller proved it was the host and then sent
+    // something unusable.
     if (module.empty() || old_state.empty() || new_state.empty())
         return false;
 
@@ -440,28 +347,18 @@ bool ModulesStateImpl::note_transition(const std::string& module,
     {
         std::lock_guard<std::mutex> lock(reg().mutex);
 
-        // THE REPLAY RULE. Applied if and only if seq is strictly newer than
-        // what is stored for THIS module.
-        //
-        // Delivery is not ordered. The first push to an un-tokened target
-        // coalesces behind a token handshake, so a later push can complete
-        // first. Per-module seq makes that harmless with no in-flight buffer,
-        // no timing assumption and no lock held across an RPC in either
-        // direction: a stale delta is simply dropped.
+        // THE REPLAY RULE: applied iff seq is strictly newer than what is
+        // stored for THIS module. Delivery is not ordered, so a later push can
+        // land first; per-module seq makes that harmless with no buffering, no
+        // timing assumption and no lock held across an RPC.
         uint64_t stored = 0;
         if (storedSeqLocked(module, stored) && seq <= stored)
             return false;
 
-        // THE MEMBERSHIP EDGE. `absent` is event-only, so a transition INTO it
-        // does not store an absent record — it removes the module from the
-        // listing and leaves a seq tombstone behind. The event still fires
-        // below, carrying the pair the caller computed, and the high-water seq
-        // still advances, so a consumer re-reading list_modules can still tell
-        // that something moved.
-        //
-        // This is the whole mechanism behind list_modules' never-absent
-        // invariant: there is no spelling of this method that puts an absent
-        // record into `records`.
+        // THE MEMBERSHIP EDGE. A transition INTO `absent` stores no record: it
+        // removes the module and leaves a seq tombstone. The event still fires
+        // and the high-water seq still advances. This is the whole mechanism
+        // behind list_modules' never-absent invariant.
         if (new_state == kAbsent) {
             // Leaving the view. Erase the record and leave a seq tombstone, so
             // a delta that lost a race cannot resurrect a module the host has
@@ -482,29 +379,19 @@ bool ModulesStateImpl::note_transition(const std::string& module,
             rec.state = new_state;
             rec.reason = reason;
             rec.seq = seq;
-            // Two classes of field, treated differently on purpose:
-            //
-            //   instance / pid  are OVERWRITTEN, including to empty. They
-            //     describe the incarnation this transition is ABOUT — an
-            //     unload's pid is the pid that just went away — so a delta is
-            //     authoritative for them and a delta that says "no pid" means
-            //     there is no pid.
-            //
-            //   path / type / version / dependencies / dependents / loadedAt
-            //     are SNAPSHOT-ONLY. A transition carries the lifecycle change,
-            //     not the module's static metadata, so whatever a previous
-            //     snapshot put there is preserved rather than blanked. A record
-            //     first learned from a delta simply has them empty until a
-            //     snapshot fills them.
+            // instance/pid are OVERWRITTEN, including to empty: they describe
+            // the incarnation this transition is ABOUT, so a delta saying "no
+            // pid" means there is no pid. path/type/version/deps/loadedAt are
+            // SNAPSHOT-ONLY and preserved rather than blanked — a delta carries
+            // the lifecycle change, not the static metadata.
         }
 
         if (seq > reg().highWaterSeq)
             reg().highWaterSeq = seq;
 
-        // The pair forwarded is the one the CALLER computed, not
-        // (ourStoredState -> new_state). Core computes old_state atomically
-        // with its own write, so its pair is the authoritative description of
-        // what happened; our stored value can only be older.
+        // The pair forwarded is the CALLER's, not (ourStoredState -> new).
+        // Core computes old_state atomically with its own write, so its pair is
+        // authoritative; our stored value can only be older.
         pending = PendingEvent{module, instance, pid, old_state, new_state, reason, seq};
     }
 
@@ -531,16 +418,11 @@ bool ModulesStateImpl::apply_snapshot(const ModuleListing& listing)
             if (incoming.module.empty())
                 continue;
 
-            // A snapshot record claiming "absent" is contract-malformed: the
-            // state is event-only, and a snapshot spells non-membership by
-            // OMISSION. Skipping it makes it mean exactly what omitting it
-            // would have meant — the prune loop below then drops whatever we
-            // hold for that name. One rule for leaving the listing, not two.
-            // An EMPTY state is skipped by the same rule. `state` is tstr on
-            // the wire with no enum to enforce it, so a record that simply
-            // omitted the field would otherwise be admitted with state "" —
-            // a seventh, undeclared state, reachable from outside and
-            // indistinguishable from a real one to every consumer.
+            // "absent" is contract-malformed here — a snapshot spells
+            // non-membership by OMISSION — so skipping makes it mean exactly
+            // what omitting it would have. An EMPTY state is skipped by the
+            // same rule: `state` is tstr with no enum, so an omitted field
+            // would otherwise be admitted as a seventh, undeclared state.
             if (incoming.state == kAbsent || incoming.state.empty())
                 continue;
 
@@ -557,10 +439,8 @@ bool ModulesStateImpl::apply_snapshot(const ModuleListing& listing)
             if (storedSeqLocked(incoming.module, stored) && incoming.seq <= stored)
                 continue;
 
-            // An unknown module is one the host has just DISCOVERED, whether it
-            // is unknown because we never heard of it or because it departed
-            // and came back. Either way the edge it just crossed is
-            // absent -> incoming.state, which is the membership edge.
+            // Unknown means just DISCOVERED — never heard of, or departed and
+            // come back. Either way the edge crossed is absent -> state.
             const std::string previousState = known ? it->second.state : std::string(kAbsent);
 
             reg().records[incoming.module] = incoming;

@@ -1,38 +1,23 @@
 #pragma once
 
-// ─────────────────────────────────────────────────────────────────────────────
 // modules_state — the read-only registry of module lifecycle state.
 //
-// WHAT THIS IS
-//   Today there are no module-lifecycle events at all: load, unload and crash
-//   are spdlog lines inside logos-liblogos' ModuleManager, so every consumer
-//   polls. This module is the place that state becomes a first-class, queryable,
-//   subscribable fact.
+// Load, unload and crash are spdlog lines inside liblogos' ModuleManager, so
+// every consumer polls. This is where that state becomes queryable and
+// subscribable. It REPORTS ONLY; load/unload stays with liblogos' C API.
 //
-// WHAT THIS IS NOT
-//   It does not drive load/unload. Nothing here starts, stops or restarts a
-//   module — that stays with liblogos' C API. This module only *reports*.
+//   read   — list_modules / module_record / is_ready + module_state_changed.
+//            Open to every module.
+//   ingest — note_transition / apply_snapshot. Host only; see INGEST AUTHORITY
+//            in the .cpp.
 //
-// THE TWO SURFACES
-//   read   — list_modules / module_record / is_ready, plus the
-//            module_state_changed event. Open to every module.
-//   ingest — note_transition / apply_snapshot. Admitted only when
-//            logos::currentCaller() reports the HOST, so authority is what the
-//            caller IS rather than what it knows and there is no secret to
-//            distribute. See INGEST AUTHORITY in modules_state_impl.cpp.
-//
-// STAGE 1 (this repo, right now)
-//   Nothing feeds it. The ingest surface is the only way state enters, which
-//   makes it both the future core seam AND the Stage-1 test injection point.
-//
-// AUTHORING RULES (universal / Qt-free) — the generator parses this header as
-// text, so these are hard constraints, not style:
+// AUTHORING RULES (universal/Qt-free). The generator parses this header as
+// TEXT, so these are constraints, not style:
 //   * no Qt types; std + declared structs only.
-//   * no trailing `// comment` on a declaration line — the parser only accepts
-//     a line ending in `;`, and silently DROPS anything else. Comments go above.
-//   * event params that are non-scalar must be `const T&`.
-//   * do not declare name()/version() — auto-injected as `derived`.
-// ─────────────────────────────────────────────────────────────────────────────
+//   * no trailing `// comment` on a declaration line — the parser wants a line
+//     ending in `;` and silently DROPS anything else. Comments go above.
+//   * non-scalar event params must be `const T&`.
+//   * do not declare name()/version(); they are auto-injected as `derived`.
 
 #include <cstdint>
 #include <optional>
@@ -41,110 +26,56 @@
 
 #include <logos_module_context.h>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// THE STATE VOCABULARY  (wire type: tstr — LIDL has no enum)
+// THE STATE VOCABULARY (wire type: tstr — LIDL has no enum)
 //
-// Six RECORD states — the ones a record returned by list_modules or
-// module_record may carry:
+// Six RECORD states, which a record may carry:
+//   unloaded   known and installed, not running
+//   loading    the host has selected a loader and is bringing it up
+//   loaded     the plugin is up and its provider has published
+//   ready      loaded AND has completed its own readiness work
+//   stopping   an orderly teardown is in progress
+//   error      it exited without being asked to
 //
-//   "unloaded"  known and installed, not running
-//   "loading"   the host has selected a loader and is bringing it up
-//   "loaded"    the plugin is up and its provider has published
-//   "ready"     loaded AND has completed its own readiness work
-//   "stopping"  an orderly teardown is in progress
-//   "error"     it exited without being asked to
+// One EVENT-ONLY state, which no record ever carries:
+//   absent     the host does not know this module
 //
-// and one EVENT-ONLY state, which no record ever carries:
+// WHY `absent` SURVIVES — do not delete it as redundant. It is the only way to
+// name the two MEMBERSHIP EDGES, and those are this module's headline claim:
+// `absent -> unloaded` on discovery, `unloaded -> absent` on prune (liblogos
+// module_registry.cpp). A transition needs a state on both sides; without it
+// those edges cannot be events at all, and a consumer is back to inferring
+// membership from package-install events plus a settle timer, which is what
+// basecamp's PackageCoordinator does today.
 //
-//   "absent"    the host does not know this module
+// AND WHY IT IS EVENT-ONLY. A module that is absent is simply NOT IN the
+// listing, and module_record answers the empty optional — one spelling for
+// "not there", not two. The invariant holds BY CONSTRUCTION: a transition into
+// `absent` removes the record, so no spelling of the ingest surface can store
+// one.
 //
-// ── WHY "absent" SURVIVES — DO NOT DELETE IT AS REDUNDANT ────────────────────
+// DIVERGENCE FROM THE DRAFT SPECS (logos-lips#317). spec-module-runtime §3.4
+// has no `absent`, so we diverge by one event-only transition target, not a
+// sixth record state — a consumer reading records sees only spec vocabulary.
+// Separately, `loading` is a record state we have and the drafts fold into
+// `loaded`; folding is a live option and is not settled here.
 //
-// It is the only way to name the two MEMBERSHIP EDGES of the graph, and those
-// edges are this module's headline claim:
+// `ready` has no emission point yet. It ships anyway so consumers written now
+// are not rewritten later — the same reason the read surface says is_ready()
+// and not isLoaded().
 //
-//   absent -> unloaded   the host has just DISCOVERED a module. In liblogos
-//                        that is the upsert loop of
-//                        discoverInstalledModules (module_registry.cpp:80-94).
-//   unloaded -> absent   the host has just PRUNED one, because its files went
-//                        away (module_registry.cpp:96-108).
-//
-// A transition needs a state on BOTH sides. Strike `absent` and those two
-// edges have no old_state and no new_state to ride on, so they cannot be
-// events at all — and a consumer is back to what logos-basecamp does today:
-// PackageCoordinator.cpp:117-157 infers module lifecycle from PACKAGE-INSTALL
-// events plus a 100ms QTimer settle. Guessing membership from package events is
-// exactly what this module exists to stop doing.
-//
-// ── AND WHY IT IS EVENT-ONLY ─────────────────────────────────────────────────
-//
-// `absent` may appear as old_state or new_state in module_state_changed. It may
-// NEVER be the `state` of a record. A module that is absent is simply NOT IN
-// list_modules, and module_record answers an empty optional.
-//
-// It used to carry a second load: it was also module_record's MISS ANSWER, a
-// workaround for a generator that refused `-> ?T`. That refusal is gone, so the
-// miss is an empty optional and the second load with it. Two spellings for "not
-// there" is the drift this narrowing removes — a consumer that filtered
-// `state == "absent"` out of a listing and a consumer that checked has_value()
-// were two code paths for one fact, and only one of them stayed correct.
-//
-// The invariant holds BY CONSTRUCTION, not by convention: a transition into
-// `absent` removes the record (see note_transition in the .cpp), so there is no
-// spelling of the ingest surface that can put an absent record into the store.
-//
-// ── DIVERGENCE FROM THE DRAFT CORE SPECS (logos-lips#317) ────────────────────
-//
-// spec-module-runtime.md §3.4 spells the runtime's vocabulary
-// `unloaded | loaded | ready | stopping | error` — five states, no `absent`,
-// and it is normative there as a CDDL enum (logos.runtime_control.state).
-//
-// After the narrowing above, `absent` diverges as exactly one EVENT-ONLY
-// TRANSITION TARGET rather than as a sixth record state. A consumer that reads
-// records already sees only spec vocabulary; only an event subscriber ever sees
-// `absent`, and only on the two membership edges above. The drafts have no way
-// to say "discovered" or "pruned" — registry membership is not in their state
-// machine at all — so this is a deliberate addition, not drift.
-//
-// One other divergence, named here so it is not mistaken for the same thing:
-// `loading` is a RECORD state we have and the drafts do not. Their `loaded`
-// covers our loading+loaded ("Runtime has acquired or attached the selected
-// realization and is performing the applicable initialization and readiness
-// checks"). Folding the two is a live option; it is a separate question from
-// `absent` and is not settled here.
-//
-// ── REACHABILITY, TODAY ──────────────────────────────────────────────────────
-//
-// Against liblogos as it stands: absent, unloaded, loading, loaded, stopping
-// and error all have real emission points. "ready" does not — it becomes real
-// when a module can report its own readiness. It ships anyway so consumers
-// written now are not rewritten then; that is the same reason the read surface
-// says is_ready() and not isLoaded().
-//
-// NORMATIVE FORWARD-COMPATIBILITY RULE — this is the whole point of shipping
-// the full vocabulary, so it is a rule and not advice:
-//   A consumer MUST treat an unrecognised state string as forward-compatible
-//   and fall back to "not loaded". It MUST NOT treat it as an error and MUST
-//   NOT crash. Without this, the day "ready" starts being emitted is the day
-//   every existing consumer breaks — the exact failure the full vocabulary
-//   exists to prevent.
-//
-// The canonical strings are exposed as functions rather than an enum because
-// the wire type is tstr; see modules_state_impl.cpp.
-// ─────────────────────────────────────────────────────────────────────────────
+// FORWARD-COMPATIBILITY RULE, normative: a consumer MUST treat an unrecognised
+// state as forward-compatible and fall back to "not loaded". It must not error
+// or crash. Otherwise the day `ready` starts being emitted is the day every
+// existing consumer breaks.
 
 // One module's lifecycle facts, as reported by the host.
 //
-// `state` is one of the six RECORD states. It is never "absent": that one is an
-// event-only transition target, and a record for a module that is not there is
-// not a record — it is the empty optional module_record answers with.
+// `state` is never "absent" — that is event-only, and a record for a module
+// that is not there is the empty optional instead.
 //
-// `instance` and `pid` answer different questions and both are cheap:
-//   instance — the host's persistence identity. STABLE across load/unload
-//              cycles (ResolveMode::ReuseOrCreate), so it cannot tell you a
-//              module died and came back.
-//   pid      — the process incarnation. A changed pid between two reads IS
-//              that answer.
+// `instance` and `pid` answer different questions: instance is the host's
+// persistence identity and is STABLE across load/unload cycles, so only a
+// changed pid tells you a module died and came back.
 struct ModuleRecord {
     std::string module;
     std::optional<std::string> instance;
@@ -162,13 +93,11 @@ struct ModuleRecord {
 
 // The answer to list_modules().
 //
-// `partial` is an honest short answer, not a health flag: it is true when the
-// host's last scan SKIPPED at least one module (unreadable metadata, or a
-// failed trusted-name check). A silently short list is worse than a flagged
-// one.
+// `partial` is an honest short answer, not a health flag: true when the host's
+// last scan SKIPPED a module. A silently short list is worse than a flagged one.
 //
-// `seq` is the listing-level high-water mark. Paired with each record's own
-// `seq` it lets a consumer re-read and tell whether anything moved underneath.
+// `seq` is the listing-level high-water mark, so a consumer re-reading can tell
+// whether anything moved underneath.
 struct ModuleListing {
     std::vector<ModuleRecord> modules;
     bool partial;
@@ -184,84 +113,54 @@ public:
 
     // Every module the host knows about, with its current state.
     //
-    // MEMBERSHIP IS THE LISTING. No record here ever carries state "absent" —
-    // a module that is absent is not a member, so it is not in `modules` at
-    // all. A consumer must not filter for it, and a consumer that finds it has
-    // found a bug in this module, not a module that went away.
+    // MEMBERSHIP IS THE LISTING: no record here carries "absent". A consumer
+    // must not filter for it, and one that finds it has found a bug here.
     ModuleListing list_modules();
 
     // One module's record — or nothing at all.
     //
-    // EMPTY means "the host's view does not contain this module": never
-    // discovered, or discovered and since pruned. That is not an error, and it
-    // is not a record either. `absent` is an EVENT-ONLY state (see THE STATE
-    // VOCABULARY above), so there is exactly ONE spelling for "not there" and
-    // this is it.
+    // EMPTY means the host's view does not contain it: never discovered, or
+    // discovered and since pruned. Not an error.
     //
-    // Why an optional and not a sentinel record: std::optional has a state no
-    // ModuleRecord value occupies, so nullopt is distinct from
-    // ModuleRecord{} — the distinction a bare record could never make. A caller
-    // branches on has_value(), not on a sentinel field it has to be told to
-    // look at. (It used to be told: the miss came back as `state:"absent"`,
-    // `seq:0`. That was a workaround for a generator that refused `-> ?T`, the
-    // refusal is gone, and the workaround went with it.)
-    //
-    // Over the wire the empty answer is JSON null, and on every surface this
-    // module is reached through, null does NOT mean the call failed:
-    //   * the generated Qt consumer decides success from the C ABI return code
-    //     (rc == LP_OK) and reports failure on a SEPARATE channel,
-    //     logos::CallError — never from the value. See logos-qt-sdk,
-    //     qt-generator/lidl_gen_qt_consumer.cpp:524-558.
-    //   * logoscore's `logosctl module call` answers
-    //     {"status":"ok","result":null}. On a null return it asks the module
-    //     for its published method list and says METHOD_NOT_FOUND only when the
-    //     method genuinely is not there — logos-logoscore-cli,
-    //     src/core_service/call_envelope.cpp:81-103.
+    // Over the wire that is JSON null, and null does NOT mean the call failed:
+    // the generated Qt consumer decides success from the C ABI return code and
+    // reports failure on logos::CallError, never from the value; logoscore
+    // answers {"status":"ok","result":null} and says METHOD_NOT_FOUND only
+    // after checking the module's published method list.
     std::optional<ModuleRecord> module_record(const std::string& module);
 
-    // True when this module is up and usable *from the host's point of view*.
+    // True when this module is up and usable FROM THE HOST'S POINT OF VIEW.
     //
-    // READ THE LIMIT: this answers "the host has it loaded and it has
-    // published". It does NOT answer "a call from ME to it will succeed" —
-    // that additionally needs the per-caller token handshake, which is
-    // per-caller and therefore not a fact this module can hold. A caller that
-    // needs "can I call it" wants whenObjectAvailable() on its own client, not
-    // this. Using is_ready() for that trades a working poll for a predicate
-    // that goes true a few hundred milliseconds early.
+    // READ THE LIMIT: it does not answer "a call from ME will succeed" — that
+    // additionally needs the per-caller token handshake, which is per-caller
+    // and so not a fact this module can hold. For "can I call it", use
+    // whenObjectAvailable() on your own client; this predicate goes true a few
+    // hundred milliseconds early for that purpose.
     bool is_ready(const std::string& module);
 
-    // ── INGEST SURFACE (host-only) ────────────────────────────────────────────
+    // ── INGEST SURFACE (host only) ───────────────────────────────────────────
 
-    // Record one state transition. Returns true when it was applied.
+    // Record one state transition. True when applied.
     //
-    // Returns FALSE for three different reasons, deliberately not
-    // distinguished on the wire (a probe must not be able to tell a refused
-    // caller from a stale seq):
-    //   * the caller is not the host,
-    //   * `seq` was not newer than what is already stored for this module,
-    //   * old_state/new_state were empty.
+    // FALSE covers three cases, deliberately not distinguished on the wire so a
+    // probe cannot tell a refused caller from a stale seq: the caller is not the
+    // host; `seq` was not newer; old_state/new_state were empty.
     //
-    // REPLAY RULE: applied if and only if `seq` is strictly greater than the
-    // seq already stored for that module. Deliveries are not ordered — the
-    // first call to an un-tokened target coalesces behind a handshake, so a
-    // later push can land first — and per-module seq is what makes that
-    // harmless without any buffering or timing assumption. The rule is TOTAL:
-    // it covers a module that has since gone absent too, which is why the .cpp
-    // keeps a seq tombstone for one that left the listing.
+    // REPLAY RULE: applied iff `seq` is strictly greater than what is stored for
+    // that module. Delivery is not ordered, so a later push can land first, and
+    // per-module seq makes that harmless with no buffering and no timing
+    // assumption. The rule is TOTAL — it covers a module that has since gone
+    // absent, which is why the .cpp keeps a seq tombstone for one that left.
     //
-    // THE TOMBSTONE PUTS A REQUIREMENT ON CORE, and it is not obvious from
-    // this side: a record pruned by apply_snapshot is tombstoned at the
-    // LISTING's seq, so core must stamp snapshot record seqs from the SAME
-    // global counter it stamps transitions from. Stamp them from anything
-    // else — a per-snapshot counter, or zero — and the tombstone is either
-    // unreachably high (a real later delta is dropped forever) or trivially
-    // low (a stale delta resurrects a module that is gone). One counter, both
-    // paths.
+    // THE TOMBSTONE PUTS A REQUIREMENT ON CORE, and it is not visible from this
+    // side: a record pruned by apply_snapshot is tombstoned at the LISTING's
+    // seq, so core must stamp snapshot record seqs from the SAME counter it
+    // stamps transitions from. Anything else makes the tombstone unreachably
+    // high (a real later delta dropped forever) or trivially low (a stale delta
+    // resurrects a pruned module).
     //
-    // A transition whose `new_state` is "absent" is a MEMBERSHIP EDGE. The
-    // event fires exactly as any other, but no absent record is stored: the
-    // module leaves the listing instead. That is what makes list_modules'
-    // never-absent invariant true by construction.
+    // `new_state == "absent"` is a MEMBERSHIP EDGE: the event fires as normal
+    // but the module leaves the listing rather than being stored absent.
     bool note_transition(const std::string& module,
                          const std::optional<std::string>& instance,
                          const std::optional<int64_t>& pid,
@@ -272,36 +171,24 @@ public:
 
     // Replace the whole picture with a host-supplied snapshot.
     //
-    // This is what makes a late-loading modules_state correct: core pushes a
-    // snapshot when this module comes up, so everything that loaded BEFORE it
-    // (capability_module always does) is still reported.
+    // This is what makes a late-loading modules_state correct: it loads after
+    // other modules, so deltas alone give it a permanently short list.
     //
-    // Merge is per-record and uses the same seq rule as note_transition, so a
-    // delta that overtook the snapshot survives it. Records missing from the
-    // listing whose stored seq is older than the listing's seq are dropped,
-    // each with its own state -> "absent" event.
+    // Merge is per-record under the same seq rule, so a delta that overtook the
+    // snapshot survives it. Records missing from the listing whose stored seq is
+    // older than the listing's are dropped, each with its own "absent" event.
     //
-    // A snapshot record whose `state` is "absent" is contract-malformed —
-    // `absent` is event-only, and a snapshot spells non-membership by OMISSION.
-    // It is skipped, which makes it mean exactly what omitting it would have
-    // meant. One rule, not two.
+    // A snapshot record claiming "absent" is contract-malformed — a snapshot
+    // spells non-membership by OMISSION — so it is skipped, which makes it mean
+    // exactly what omitting it would have meant.
     bool apply_snapshot(const ModuleListing& listing);
 
-    // Number of ingest calls refused BY THE AUTHORITY GATE — not stale-seq
-    // drops, not malformed arguments. A counter, not an event.
-    //
-    // It carries more weight than it looks: a build whose caller machinery is
-    // missing (a stale logos-module-builder pin) refuses every push while
-    // compiling, linking and loading perfectly, so this counter climbing while
-    // the listing stays empty is the only external symptom that failure has.
-    uint64_t rejected_ingest_count();
-
 logos_events:
-    // Emitted on every APPLIED transition — including the ones apply_snapshot
+    // Emitted on every APPLIED transition, including those apply_snapshot
     // applies.
     //
-    // A transition PAIR, not a "kind" string: strictly more informative, and a
-    // consumer that only cares that something went away just reads new_state.
+    // A transition PAIR rather than a "kind" string: strictly more informative,
+    // and a consumer that only cares something went away reads new_state.
     // old_state is never equal to new_state; a no-op is not an event.
     void module_state_changed(const std::string& module,
                               const std::optional<std::string>& instance,

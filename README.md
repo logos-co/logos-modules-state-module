@@ -31,7 +31,6 @@ type ModuleListing { modules: [ModuleRecord], partial: bool, seq: uint }
 method list_modules()              -> ModuleListing
 method module_record(module: tstr) -> ?ModuleRecord
 method is_ready(module: tstr)      -> bool
-method rejected_ingest_count()     -> uint
 
 # ingest surface — admitted only when currentCaller() is the HOST
 method note_transition(module, instance: ?tstr, pid: ?int,
@@ -167,7 +166,10 @@ field on `ModuleDescriptor` plumbed through `logos-container` and
 reaches this module (measured: `kind=host`), and a structural check beats a
 secret, so the token and all of that plumbing are retired.
 
-### The failure mode worth knowing
+### The one pairing this depends on
+
+This module requires a host that carries the caller machinery, and it ships
+alongside one. That pairing is load-bearing rather than incidental.
 
 **A stale `logos-module-builder` pin degrades caller identity to `unknown`
 silently.** Measured: at `bc72ce39` the built plugin contained no caller
@@ -176,9 +178,9 @@ and every call answered `kind=unknown`; at master `464a75d` the same probe
 answers `kind=host`. It compiles, links and loads either way, and nothing warns.
 
 A fail-closed gate on `unknown` then refuses **every** push — inert rather than
-secure, with no error anywhere. That is why `rejected_ingest_count()` counts
-refusals by the authority gate and nothing else: a counter climbing while
-`list_modules` stays empty is the only external symptom that failure has.
+secure. There is no counter on this surface to ask about it: the refusal is
+written to **stderr**, naming what the caller actually was, with `unknown`
+getting its own message pointing at the pin. That log line is the symptom.
 
 One caveat on the measurement: it is macOS. `logos_caller.h` notes that on ELF
 at default visibility a function-local static in an inline function emits as
