@@ -151,3 +151,36 @@ LOGOS_TEST(ingest_is_refused_when_no_door_is_open)
     // left records behind.
     LOGOS_ASSERT(!listingHas(m.list_modules(), "chat_module"));
 }
+
+// `loaded` is not `ready`. liblogos marks a module loaded when it owns the
+// process, and emits loaded->ready only once the module publishes its object.
+// is_ready() must answer false in that window — it is the window callers ask
+// about — and an unknown state must not be optimistic either.
+LOGOS_TEST(ready_is_publish_not_load)
+{
+    OpenIngest gate;
+    ModulesStateImpl m;
+
+    LOGOS_ASSERT(note(m, "eth_rpc_module", "absent", "unloaded", 1));
+    LOGOS_ASSERT(!m.is_ready("eth_rpc_module"));
+
+    LOGOS_ASSERT(note(m, "eth_rpc_module", "unloaded", "loading", 2));
+    LOGOS_ASSERT(!m.is_ready("eth_rpc_module"));
+
+    // The window: the host owns the process, the object is not up yet.
+    LOGOS_ASSERT(note(m, "eth_rpc_module", "loading", "loaded", 3));
+    LOGOS_ASSERT(!m.is_ready("eth_rpc_module"));
+
+    LOGOS_ASSERT(note(m, "eth_rpc_module", "loaded", "ready", 4));
+    LOGOS_ASSERT(m.is_ready("eth_rpc_module"));
+
+    // Going away closes it again.
+    LOGOS_ASSERT(note(m, "eth_rpc_module", "ready", "stopping", 5));
+    LOGOS_ASSERT(!m.is_ready("eth_rpc_module"));
+
+    // A module nobody reported is not ready, and neither is an unrecognised
+    // state — forward compatibility fails closed.
+    LOGOS_ASSERT(!m.is_ready("never_seen_module"));
+    LOGOS_ASSERT(note(m, "eth_rpc_module", "stopping", "quiescing", 6));
+    LOGOS_ASSERT(!m.is_ready("eth_rpc_module"));
+}

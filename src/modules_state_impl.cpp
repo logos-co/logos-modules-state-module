@@ -46,18 +46,16 @@ constexpr const char* kReady  = "ready";
 
 // "Up and usable, as far as the host is concerned."
 //
-// `loaded` is in this set BECAUSE `ready` has no emission point yet; with
-// {ready} alone this would answer false forever. When a real loaded->ready
-// transition exists, `loaded` leaves the set — not a silent break, since the
-// only change is that is_ready() goes false during the loaded-but-not-ready
-// window, which is precisely the window a caller was asking about.
+// `loaded` is NOT in this set: liblogos emits loaded->ready once the module
+// publishes its object, so is_ready() is false during that window — which is
+// precisely the window a caller is asking about.
 //
 // An unrecognised state answers false: the same forward-compatibility fallback
 // the contract imposes on consumers. A module that demands others tolerate
 // unknown states has to do it itself.
 bool stateIsReady(const std::string& state)
 {
-    return state == kLoaded || state == kReady;
+    return state == kReady;
 }
 
 // The stored form of a ModuleRecord. Identical to the wire record; kept as its

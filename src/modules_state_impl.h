@@ -31,8 +31,8 @@
 // Six RECORD states, which a record may carry:
 //   unloaded   known and installed, not running
 //   loading    the host has selected a loader and is bringing it up
-//   loaded     the plugin is up and its provider has published
-//   ready      loaded AND has completed its own readiness work
+//   loaded     the host owns the process; the object may not be up yet
+//   ready      loaded AND the module has published its object
 //   stopping   an orderly teardown is in progress
 //   error      it exited without being asked to
 //
