@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: logos-co
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Build module
+        run: nix build -L
+
+      # `.#unit-tests` is the SAME DERIVATION as checks.<system>.unit-tests
+      # (verified: identical drvPath), and it RUNS the suite rather than only
+      # compiling it. That distinction matters here: mkLogosModuleTests finds
+      # suites with
+      #   find . -maxdepth 1 -executable \( -name "*_tests" -o -name "*_test" \)
+      # so a binary named anything else is built, matched by nothing, never
+      # executed -- and the check still goes GREEN. This suite was once named
+      # `modules_state_invariants` and passed three mutation tests it should
+      # have caught before that was spotted.
+      - name: Run unit tests
+        run: nix build .#unit-tests -L
+
+      # Packaging is a separate failure mode from compiling: the .lgx payload
+      # layout and the install tree are built by different code than the plugin.
+      - name: Build installable package
+        run: nix build .#install -L

@@ -10,10 +10,12 @@ first-class, queryable, subscribable fact.
 
 It **reports**. It does not drive load/unload — that stays with liblogos' C API.
 
-## Status: Stage 1
+## Status
 
-Nothing feeds it yet. The module is complete and standalone; the liblogos
-registry observer and the core push that will feed it are Stages 2 and 3.
+The module is complete and standalone. The liblogos **registry observer** that
+turns load/unload/crash/discovery into sequenced transitions is merged
+(logos-liblogos#189); the **core push** that carries them across this wire is in
+progress. Until that lands, nothing feeds this module in a normal run.
 
 ## Contract
 
@@ -29,12 +31,11 @@ type ModuleListing { modules: [ModuleRecord], partial: bool, seq: uint }
 method list_modules()              -> ModuleListing
 method module_record(module: tstr) -> ?ModuleRecord
 method is_ready(module: tstr)      -> bool
-method rejected_ingest_count()     -> uint
 
-# ingest surface — authToken-gated, for liblogos core only
-method note_transition(authToken, module, instance: ?tstr, pid: ?int,
+# ingest surface — admitted only when currentCaller() is the HOST
+method note_transition(module, instance: ?tstr, pid: ?int,
                        old_state, new_state, reason: ?tstr, seq: uint) -> bool
-method apply_snapshot(authToken: tstr, listing: ModuleListing) -> bool
+method apply_snapshot(listing: ModuleListing) -> bool
 
 event module_state_changed(module, instance: ?tstr, pid: ?int,
                            old_state, new_state, reason: ?tstr, seq: uint)
@@ -124,22 +125,68 @@ Two traps if you write one yourself:
 
 `note_transition` and `apply_snapshot` write the facts every other module is
 about to trust, so the ingest surface is gated while the read surface is open.
-The token is an **argument** because liblogos' `AccessPolicy` restricts by target
-module with no per-method granularity — restricting `modules_state` to caller
-`core` would lock out every reader.
 
-| environment | behaviour |
+**The gate is structural: the caller must be the host.**
+
+```cpp
+logos::currentCaller().isHost()      // logos-cpp-sdk, cpp/logos_caller.h
+```
+
+A push from core arrives as `{"kind":"host"}`; a call from any module arrives as
+`{"kind":"module","name":…}`. So authority is what the caller **is**, not what it
+knows — no secret to distribute, rotate or leak.
+
+`host` carries **no name**, by rule 5 of the caller contract: `core` and
+`capability_module` hold the same token value under two keys, so a name there
+"would be a coin flip presented as a fact". The gate therefore admits core *or*
+capability_module — both host-side components of the runtime rather than peer
+modules, which is the distinction that matters here.
+
+| caller | behaviour |
 |---|---|
-| `LOGOS_MODULES_STATE_INGEST_TOKEN=<nonce>` | ingest requires an exact match. The production shape: the host generates a per-run nonce and puts it in the module subprocess's environment. |
-| neither set | **all ingest refused.** Fail closed. |
-| `LOGOS_MODULES_STATE_TEST_INGEST=1` (and no token) | **test only.** Any token accepted, with a loud stderr banner on every accepted write. |
+| `kind=host` | accepted |
+| `kind=module` | **refused**, counted, and named on stderr |
+| `kind=unknown` | **refused**, counted. Fail closed. |
+| `LOGOS_MODULES_STATE_TEST_INGEST=1` | **test only.** Any caller accepted, with a loud stderr banner. |
 
-The test escape is an environment variable and not a method on purpose: a method
-would itself be callable by any module, which would make the gate decorative.
+The test door exists because a unit test calls the impl directly — no dispatch,
+so no caller, so `Unknown` — and without it these invariants could only be
+exercised by driving a live daemon, which is not a thing CI does. It is an
+environment variable and not a method on purpose: a method would itself be
+callable by any module, which would make the gate decorative.
 
-`rejected_ingest_count()` counts refusals **by the authority gate** and nothing
-else — not stale-seq drops, not malformed arguments — so a test asserting "the
-gate is closed" asserts exactly that.
+### This replaced a shared secret, and why
+
+The ingest surface used to take an `authToken` argument compared against a
+per-run nonce in `LOGOS_MODULES_STATE_INGEST_TOKEN`. That design existed only
+because the accessor did not — `LogosModuleContext` exposes this module's own
+identity and nothing about the caller — and it would have required an `env`
+field on `ModuleDescriptor` plumbed through `logos-container` and
+`logos-container-subprocess` to deliver the nonce. The accessor landed, it
+reaches this module (measured: `kind=host`), and a structural check beats a
+secret, so the token and all of that plumbing are retired.
+
+### The one pairing this depends on
+
+This module requires a host that carries the caller machinery, and it ships
+alongside one. That pairing is load-bearing rather than incidental.
+
+**A stale `logos-module-builder` pin degrades caller identity to `unknown`
+silently.** Measured: at `bc72ce39` the built plugin contained no caller
+machinery at all (`nm` finds no `CallerScope`, no `currentInboundCallerJson`)
+and every call answered `kind=unknown`; at master `464a75d` the same probe
+answers `kind=host`. It compiles, links and loads either way, and nothing warns.
+
+A fail-closed gate on `unknown` then refuses **every** push — inert rather than
+secure. There is no counter on this surface to ask about it: the refusal is
+written to **stderr**, naming what the caller actually was, with `unknown`
+getting its own message pointing at the pin. That log line is the symptom.
+
+One caveat on the measurement: it is macOS. `logos_caller.h` notes that on ELF
+at default visibility a function-local static in an inline function emits as
+`STB_GNU_UNIQUE` and the linker collapses every image's copy into one, and that
+`logos-module-builder` sets no visibility anywhere — so Linux deserves its own
+measurement before this is relied on there.
 
 ## The replay rule
 
