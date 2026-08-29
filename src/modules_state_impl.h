@@ -34,7 +34,7 @@
 //   loaded     the host owns the process; the object may not be up yet
 //   ready      loaded AND the module has published its object
 //   stopping   an orderly teardown is in progress
-//   error      it exited without being asked to
+//   error      its load failed, or it exited without being asked to
 //
 // One EVENT-ONLY state, which no record ever carries:
 //   absent     the host does not know this module
