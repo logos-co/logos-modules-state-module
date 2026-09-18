@@ -3,6 +3,10 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # Cut the builder -> standalone-app -> liblogos -> this-module cycle, as
+    # logos-capability-module does. Safe only because this is a `core` module:
+    # mkLogosModule forces the input for type "ui" alone. Never copy to ui/ui_qml.
+    logos-module-builder.inputs.logos-standalone-app.follows = "";
   };
 
   outputs = inputs@{ logos-module-builder, ... }:
