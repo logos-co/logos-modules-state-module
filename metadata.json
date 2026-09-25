@@ -6,6 +6,7 @@
   "author": "Logos Core Team",
   "type": "core",
   "interface": "universal",
+  "transport": "qt_remote_plain",
   "concurrency": "single",
   "category": "system",
   "main": "modules_state_plugin",
