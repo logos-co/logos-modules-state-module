@@ -19,16 +19,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1790307393,
-        "narHash": "sha256-6X9i+ZHZVPUoiJfzgtyBrUOHe2RK8lPmHeKJEFP1oi8=",
+        "lastModified": 1790445668,
+        "narHash": "sha256-h30Y4cMEYTK6oXCOqVqaG/H6D0kuIl7cMmG9P0VnhxQ=",
         "owner": "logos-co",
         "repo": "logos-cpp-sdk",
-        "rev": "4e5f8c8ba4d9ff096c02614a37ad9a52dac27cd9",
+        "rev": "290c3ff4db8e4d71224e11b447089f8817ed1b88",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
-        "ref": "feat/runtime-delegate-export",
+        "ref": "feat/standalone-apps",
         "repo": "logos-cpp-sdk",
         "type": "github"
       }
@@ -413,16 +413,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1790348013,
-        "narHash": "sha256-0q1aff3uTBLBwtPHhS/rwbBJEH4y9xjFV+5q0qyhJ18=",
+        "lastModified": 1790445780,
+        "narHash": "sha256-hbv16FGFZBswQz0HbvJerq88B2/QH9V7kiypx/sUtaA=",
         "owner": "logos-co",
         "repo": "logos-module-builder",
-        "rev": "b372acd57cfb6b205651df3c3ad7dd43fe8e0ace",
+        "rev": "5175e49ba1237c390f4f0666342590a34ba80c53",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
-        "ref": "feat/drop-legacy-mode",
+        "ref": "feat/standalone-apps",
         "repo": "logos-module-builder",
         "type": "github"
       }
@@ -780,15 +780,16 @@
         "nixpkgs-windows": "nixpkgs-windows_3"
       },
       "locked": {
-        "lastModified": 1789054121,
-        "narHash": "sha256-EOG96lY4KnZadh2lczZFMPnfPP9tWXdWt1p1CP8Gvww=",
+        "lastModified": 1790445097,
+        "narHash": "sha256-3IqctoP7XYOP6yor+uB16lBKPytP/PyAXp1VBpLjkw4=",
         "owner": "logos-co",
         "repo": "logos-nix",
-        "rev": "7c1eb8bc390546f32aaf134866a1c7db8e9311cc",
+        "rev": "12022015768c7239c4072657be818e6b9f8aca34",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
+        "ref": "feat/standalone-apps",
         "repo": "logos-nix",
         "type": "github"
       }
@@ -1003,16 +1004,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1790307364,
-        "narHash": "sha256-oKRYe5APOTB6+a0+LihXi1CYEkILK/4/gBo2NcLK29k=",
+        "lastModified": 1790442985,
+        "narHash": "sha256-aoBU6QGIa2IrOVnAtBydISKceN7XUlZJ0V9HRIK4iwE=",
         "owner": "logos-co",
         "repo": "logos-plugin-qt",
-        "rev": "549aadf698ec96ae200b329b7698b792810fd8a0",
+        "rev": "4622063741049c91916737f86599e456710b913b",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
-        "ref": "chore/relock-protocol-0.13",
+        "ref": "feat/standalone-apps",
         "repo": "logos-plugin-qt",
         "type": "github"
       }
@@ -1037,16 +1038,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1790307364,
-        "narHash": "sha256-oKRYe5APOTB6+a0+LihXi1CYEkILK/4/gBo2NcLK29k=",
+        "lastModified": 1790442985,
+        "narHash": "sha256-aoBU6QGIa2IrOVnAtBydISKceN7XUlZJ0V9HRIK4iwE=",
         "owner": "logos-co",
         "repo": "logos-plugin-qt",
-        "rev": "549aadf698ec96ae200b329b7698b792810fd8a0",
+        "rev": "4622063741049c91916737f86599e456710b913b",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
-        "ref": "chore/relock-protocol-0.13",
+        "ref": "feat/standalone-apps",
         "repo": "logos-plugin-qt",
         "type": "github"
       }
@@ -1133,16 +1134,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1790347922,
-        "narHash": "sha256-pWdIFwBgvhD4SVWceuI/ynTYXsik6yTMu5ZMrmNe9tc=",
+        "lastModified": 1790445526,
+        "narHash": "sha256-Ez/gkE0MedIHpWH8WjrzGeNzM535+iyJUMeQDMv55YQ=",
         "owner": "logos-co",
         "repo": "logos-protocol",
-        "rev": "629438336a86afebcfb575ee023bd5a30a43958f",
+        "rev": "1abd02c2482833d60e3605537f17dfc6d5744e3b",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
-        "ref": "feat/drop-legacy-mode",
+        "ref": "feat/standalone-apps",
         "repo": "logos-protocol",
         "type": "github"
       }
