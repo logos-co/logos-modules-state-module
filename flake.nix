@@ -2,7 +2,8 @@
   description = "modules_state - read-only registry of module lifecycle state";
 
   inputs = {
-    logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # On the in-process builder (logos-module-builder#261) until it and the chain under it merge.
+    logos-module-builder.url = "github:logos-co/logos-module-builder/feat/inproc-eligible-plain";
     # Cut the builder -> standalone-app -> liblogos -> this-module cycle, as
     # logos-capability-module does. Safe only because this is a `core` module:
     # mkLogosModule forces the input for type "ui" alone. Never copy to ui/ui_qml.
